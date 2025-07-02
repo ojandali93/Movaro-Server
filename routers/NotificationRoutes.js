@@ -1,4 +1,4 @@
-import { sendPush } from '../utils/APN.js';
+import { sendPush } from '../utils/apn.js';
 import { Router } from 'express';
 
 const router = Router();
