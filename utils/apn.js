@@ -9,7 +9,7 @@ const keyFilePath = path.join(os.tmpdir(), 'apns_key.p8');
 
 // Write the key file only once (Render's temp dir resets on each deploy)
 if (!fs.existsSync(keyFilePath)) {
-  const keyBuffer = Buffer.from(process.env.APN_PRIVATE_KEY_B64, 'base64');
+  const keyBuffer = Buffer.from(process.env.APN_PRIVATE_KEY, 'base64');
   fs.writeFileSync(keyFilePath, keyBuffer);
 }
 
