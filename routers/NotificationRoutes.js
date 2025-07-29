@@ -8,16 +8,29 @@ const router = Router();
 
 // Trigger push
 router.post('/send', async (req, res) => {
-  const { token, title, body } = req.body;
+  const { token, title, body, sendAt } = req.body;
+  if (sendAt) {
+    setTimeout(async () => {
+      try {
+        const result = await sendPush(token, title, body);
+        console.log('📤 Scheduled APNs result:', JSON.stringify(result, null, 2));
+      } catch (err) {
+        console.error('❌ Scheduled push error:', err);
+      }
+    }, sendAt);
 
-  try {
-    const result = await sendPush(token, title, body);
-    console.log('📤 APNs result:', JSON.stringify(result, null, 2));
+    console.log(`⏳ Notification scheduled in ${sendAt / 60000} seconds`);
 
-    return res.status(200).json({ success: true });
-  } catch (err) {
-    console.error('❌ Push route error:', err);
-    return res.status(500).json({ error: 'Internal server error' });
+    return res.status(200).json({ success: true, scheduled: true, delayInMs: sendAt });
+  } else {
+    try {
+      const result = await sendPush(token, title, body);
+      console.log('📤 APNs result:', JSON.stringify(result, null, 2));
+      return res.status(200).json({ success: true });
+    } catch (err) {
+      console.error('❌ Push route error:', err);
+      return res.status(500).json({ error: 'Internal server error' });
+    }
   }
 });
 
@@ -165,6 +178,36 @@ router.post('/upload-pickup-image', upload.single('file'), async (req, res) => {
     }
 
     const publicUrl = `https://bsatjkrkstfwcmvsjzqp.supabase.co/storage/v1/object/public/pickup-images/${uniqueName}`;
+
+    return res.status(200).json({ success: true, url: publicUrl });
+  } catch (error) {
+    console.error('Server error:', error);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/upload-driver-image', upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'No file provided.' });
+    }
+
+    const fileBuffer = req.file.buffer;
+    const originalName = req.file.originalname;
+    const uniqueName = `${uuidv4()}_${originalName}`;
+
+    const { data, error } = await supabase.storage
+      .from('driver-images')
+      .upload(uniqueName, fileBuffer, {
+        contentType: req.file.mimetype,
+      });
+
+    if (error) {
+      console.error('Supabase upload error:', error);
+      return res.status(500).json({ error: 'Failed to upload to storage' });
+    }
+
+    const publicUrl = `https://bsatjkrkstfwcmvsjzqp.supabase.co/storage/v1/object/public/driver-images/${uniqueName}`;
 
     return res.status(200).json({ success: true, url: publicUrl });
   } catch (error) {
