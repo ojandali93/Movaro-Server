@@ -35,7 +35,7 @@ app.use(express.json({ limit: '20mb' }));
 app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 
 // Routes
-app.use('notifications/api/', NotificationRoutes);
+app.use('/notifications', NotificationRoutes);
 app.get('/health', (req, res) => res.send('✅ Marhaba backend is running'));
 
 // --- SERVER START ---
