@@ -8,7 +8,7 @@ import nodemailer from 'nodemailer';
 const router = Router();
 
 router.post('/send-invite', async (req, res) => {
-  const { to, name, businessName, link, imageUrl } = req.body;
+  const { to, name, businessName, link, referenceCode, imageUrl } = req.body;
 
   if (!to || !name || !businessName || !link) {
     return res.status(400).json({ error: 'Missing required fields.' });
@@ -35,6 +35,9 @@ router.post('/send-invite', async (req, res) => {
         <p>You’ve been invited to join <strong>${businessName}</strong> on Movaro!</p>
         <p>Please click the button below to download the app and complete your signup:</p>
         <a href="${link}" style="background-color: #1D4ED8; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Download Movaro</a>
+        <br /><br />
+        ${referenceCode ? `<p>Invitation Code: ${referenceCode}</p>` : ''}
+        <p>Use the invitation code to sign up in the app.</p>
         <br /><br />
         ${imageUrl ? `<img src="${imageUrl}" alt="Movaro" style="margin-top: 20px; max-width: 100%; height: auto;" />` : ''}
         <p style="margin-top: 20px;">If you have any questions, contact your manager or support@movaro.app.</p>
