@@ -3,6 +3,7 @@ import { Router } from 'express';
 import multer from 'multer';
 import { v4 as uuidv4 } from 'uuid';
 import { supabase } from '../utils/supabase.js';
+import nodemailer from 'nodemailer';
 
 const router = Router();
 
@@ -213,6 +214,48 @@ router.post('/upload-driver-image', upload.single('file'), async (req, res) => {
   } catch (error) {
     console.error('Server error:', error);
     return res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+router.post('/send-invite', async (req, res) => {
+  const { to, name, businessName, link, imageUrl } = req.body;
+
+  if (!to || !name || !businessName || !link) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  try {
+    const transporter = nodemailer.createTransport({
+      service: 'Gmail',
+      auth: {
+        user: process.env.GMAIL_USERNAME,
+        pass: process.env.GMAIL_PASSWORD,
+      },
+    });
+
+    const htmlContent = `
+      <div style="font-family: sans-serif; padding: 20px;">
+        <h2>Hi ${name},</h2>
+        <p>You’ve been invited to join <strong>${businessName}</strong> on Movaro!</p>
+        <p>Please click the button below to download the app and complete your signup:</p>
+        <a href="${link}" style="background-color: #1D4ED8; color: white; padding: 10px 20px; text-decoration: none; border-radius: 5px;">Download Movaro</a>
+        <br /><br />
+        ${imageUrl ? `<img src="${imageUrl}" alt="Movaro" style="margin-top: 20px; max-width: 100%; height: auto;" />` : ''}
+        <p style="margin-top: 20px;">If you have any questions, contact your manager or support@movaro.app.</p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from: process.env.EMAIL_USERNAME,
+      to,
+      subject: `You're Invited to Join ${businessName} on Movaro`,
+      html: htmlContent,
+    });
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Error sending invite email:', error);
+    res.status(500).json({ error: 'Failed to send email.' });
   }
 });
 
