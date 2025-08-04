@@ -14,6 +14,12 @@ router.post('/send-invite', async (req, res) => {
     return res.status(400).json({ error: 'Missing required fields.' });
   }
 
+  console.log('to: ', to);
+  console.log('name: ', name);
+  console.log('businessName: ', businessName);
+  console.log('link: ', link);
+  console.log('imageUrl: ', imageUrl);
+
   try {
     const transporter = nodemailer.createTransport({
       service: 'Gmail',
