@@ -36,7 +36,7 @@ router.post('/send-invite', async (req, res) => {
     `;
 
     await transporter.sendMail({
-      from: process.env.EMAIL_USERNAME,
+      from: process.env.GMAIL_USERNAME,
       to,
       subject: `You're Invited to Join ${businessName} on Movaro`,
       html: htmlContent,
