@@ -83,6 +83,7 @@ router.post('/send-bulk-message', async (req, res) => {
     vendor_count,
     expected_file_format,
     notes,
+    type
   } = req.body;
 
   try {
@@ -107,11 +108,11 @@ router.post('/send-bulk-message', async (req, res) => {
       },
     });
 
-    const subject = `Bulk Upload Request – ${business_name} (${first_name} ${last_name})`;
+    const subject = `Bulk Upload (${type}) – ${business_name} (${first_name} ${last_name})`;
 
     const htmlContent = `
       <div style="font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial; padding:20px; line-height:1.5;">
-        <h2 style="margin:0 0 12px;">Bulk Upload Request</h2>
+        <h2 style="margin:0 0 12px;">Bulk Upload Request (${type})</h2>
         <p style="margin:0 0 16px;">A Movaro user has requested a <strong>bulk upload of customers and vendors</strong>.</p>
 
         <h3 style="margin:16px 0 8px;">User Details</h3>
