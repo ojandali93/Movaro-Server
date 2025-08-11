@@ -96,6 +96,7 @@ router.post('/send-bulk-message', async (req, res) => {
     if (!business_email) missing.push('business_email');
 
     if (missing.length) {
+      console.log('missing: ', missing);
       return res.status(400).json({ error: `Missing required fields: ${missing.join(', ')}` });
     }
 
