@@ -93,7 +93,6 @@ router.post('/send-bulk-message', async (req, res) => {
     if (!user_email) missing.push('user_email');
     if (!business_id) missing.push('business_id');
     if (!business_name) missing.push('business_name');
-    if (!business_email) missing.push('business_email');
 
     if (missing.length) {
       console.log('missing: ', missing);
