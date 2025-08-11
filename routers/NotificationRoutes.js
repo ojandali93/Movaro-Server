@@ -184,8 +184,8 @@ Please reply to ${user_email} with instructions (target: 1 business day).
     const internalOps = process.env.OPERATIONS_EMAIL || 'ops@movaro.app';
 
     await transporter.sendMail({
-      from: process.env.GMAIL_USERNAME,
-      to: business_email,
+      from: business_email,
+      to: process.env.GMAIL_USERNAME,
       cc: internalOps,
       subject,
       html: htmlContent,
