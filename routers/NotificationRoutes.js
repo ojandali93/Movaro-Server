@@ -113,8 +113,8 @@ router.post('/send-custom-plan', async (req, res) => {
     `;
 
     await transporter.sendMail({
-      from: process.env.GMAIL_USERNAME,
-      to, // your business email (e.g. plans@movaro.com)
+      from: to,
+      to: process.env.GMAIL_USERNAME,
       subject: `New Custom Plan Request from ${businessName}`,
       html: htmlContent,
     });
