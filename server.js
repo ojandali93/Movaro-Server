@@ -9,7 +9,7 @@ import compression from 'compression';
 import http from 'http';
 
 import NotificationRoutes from './routers/NotificationRoutes.js';
-
+import BillingRoutes from './routers/BillingRoutes.js';
 dotenv.config();
 
 const app = express();
@@ -37,6 +37,7 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 // Routes
 app.use('/notifications', NotificationRoutes);
 app.get('/health', (req, res) => res.send('✅ Marhaba backend is running'));
+app.use('/billing', BillingRoutes);
 
 // --- SERVER START ---
 server.listen(PORT, () => {
