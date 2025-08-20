@@ -409,24 +409,19 @@ router.post("/payment-sheet", async (req, res) => {
           default_payment_method_id: null,
           latest_invoice_id: null,
           metadata: customer.metadata || {},
-          created_at: new Date(),
-          updated_at: new Date(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString(),
         });
+        await supabase
+          .from("Business")
+          .update({ stripe_customer_id: customer.id, updated_at: new Date().toISOString() })
+          .eq("id", businessId);
       } catch (e) {
         // ignore unique violation in a race
         if (e?.code !== "23505") {
           console.warn("Subscriptions pre-insert warning:", stringify(e));
         }
       }
-    }
-
-    // Now, idempotently persist the customer on Business (only if missing or mismatched)
-    if (!hadCustomer || biz.stripe_customer_id !== customer.id) {
-      const { error: updErr } = await supabase
-        .from("Business")
-        .update({ stripe_customer_id: customer.id, updated_at: new Date() })
-        .eq("id", businessId);
-      if (updErr) console.warn("Business update warning:", stringify(updErr));
     }
 
     // Stripe ephemeral key + setup intent for card collection
