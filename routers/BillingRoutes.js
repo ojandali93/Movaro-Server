@@ -27,7 +27,7 @@ async function ensureDefaultPM(customerId) {
 // POST /billing/payment-sheet
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const { userId, email } = req.body;
+    const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body;
 
     // Ensure a Stripe Customer exists for this user
     let customer;
@@ -57,17 +57,18 @@ router.post("/payment-sheet", async (req, res) => {
     const storedPayment = await supabase
       .from('Subscriptions')
       .insert({
-        business_id: userId,
+        business_id: businessId,
+        user_id: userId,
         stripe_customer_id: customer.id,
         stripe_subscription_id: null,
-        tier: 'starter',
+        tier,
         billing_mode: 'monthly',
-        payment_amount_cents: 0,
+        payment_amount_cents: paymentAmount,
         currency: 'usd',
-        total_drivers: 1,
-        total_stops: 100,
-        drivers_left: 1,
-        stops_left: 100,
+        total_drivers: totalDrivers,
+        total_stops: totalStops,
+        drivers_left: driversLeft,
+        stops_left: stopsLeft,
         status: 'active',
         last_payment_at: new Date(),
         current_period_start: new Date(),
@@ -76,7 +77,8 @@ router.post("/payment-sheet", async (req, res) => {
         canceled_at: null,
         default_payment_method_id: null,
         latest_invoice_id: null,
-        metadata: {},
+        metadata: customer.metadata,
+        delinquent: customer.delinquent,
         created_at: new Date(),
       })
       .select()
