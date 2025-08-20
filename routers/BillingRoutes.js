@@ -388,7 +388,7 @@ router.post("/payment-sheet", async (req, res) => {
     if (mustInsertPending) {
       console.log("mustInsertPending", mustInsertPending);
       try {
-        await supabase.from("Subscriptions").insert({
+        const pendingRow = {
           business_id: businessId,
           user_id: userId,
           stripe_customer_id: customer.id,
@@ -409,16 +409,44 @@ router.post("/payment-sheet", async (req, res) => {
           canceled_at: null,
           default_payment_method_id: null,
           latest_invoice_id: null,
-          metadata: customer.metadata || {},
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        });
-        console.log("customer", customer.id);
-        console.log("businessId", businessId);
-        await supabase
+          // ⚠️ remove the next line if your table doesn't have a "metadata" column
+          // metadata: customer.metadata || {},
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        const { data: insData, error: insErr } = await supabase
+          .from("Subscriptions")
+          .insert(pendingRow)
+          .select("id")
+          .single();
+
+        if (insErr) {
+          // Unique violation racing? -> ignore only that specific code
+          if (insErr.code === "23505") {
+            console.warn("Pending subscription already exists (23505). Skipping insert.");
+          } else {
+            console.error("Subscriptions insert failed:", insErr);
+            // Bail early so we don't update Business on a failed insert.
+            return res.status(400).json({ error: "pending insert failed", detail: insErr.message || String(insErr) });
+          }
+        } else {
+          console.log("Inserted pending Subscriptions.id =", insData?.id);
+        }
+
+        // 2) Now persist customer to Business (idempotent)
+        const { error: updErr } = await supabase
           .from("Business")
-          .update({ stripe_customer_id: customer.id, updated_at: new Date().toISOString() })
-          .eq("id", businessId);
+          .update({ stripe_customer_id: customer.id, updated_at: new Date() })
+          .eq("id", businessId)
+          .select("id")
+          .single();
+
+        if (updErr) {
+          console.error("Business update failed:", updErr);
+          // Not fatal for PaymentSheet; continue
+        } else {
+          console.log("Business.stripe_customer_id set to", customer.id);
+        }
       } catch (e) {
         // ignore unique violation in a race
         if (e?.code !== "23505") {
