@@ -717,6 +717,8 @@ router.post("/customers", async (req, res) => {
       forceNew,
     } = req.body || {};
 
+    console.log("req.body", req.body);
+
     if (!name || !email) {
       return res.status(400).json({ error: "Missing required fields: name, email" });
     }
