@@ -33,14 +33,14 @@ router.post("/payment-sheet", async (req, res) => {
     let customer;
     const existing = await stripe.customers.list({ email, limit: 1 });
     if (existing.data.length > 0) {
-      console.log('existing: ', existing);
+      console.log('existing: ', JSON.stringify(existing, null, 2));
       customer = existing.data[0];
     } else {
       customer = await stripe.customers.create({
         email,
         metadata: { userId },
       });
-      console.log('customer: ', customer);
+      console.log('customer: ', JSON.stringify(customer, null, 2));
     }
 
     // Create an ephemeral key for the client
@@ -60,7 +60,7 @@ router.post("/payment-sheet", async (req, res) => {
         business_id: userId,
         stripe_customer_id: customer.id,
         stripe_subscription_id: null,
-        tier: 'free',
+        tier: 'starter',
         billing_mode: 'monthly',
         payment_amount_cents: 0,
         currency: 'usd',
@@ -82,7 +82,7 @@ router.post("/payment-sheet", async (req, res) => {
       .select()
       .single();
 
-    console.log('storedPayment: ', storedPayment);
+    console.log('storedPayment: ', JSON.stringify(storedPayment, null, 2));
 
     res.json({
       customerId: customer.id,
