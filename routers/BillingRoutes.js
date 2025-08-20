@@ -360,6 +360,9 @@ router.post("/payment-sheet", async (req, res) => {
           created_at: new Date(),
           updated_at: new Date(),
         }, { onConflict: "business_id,status" }); // requires a partial unique index: see SQL below
+        await supabase.from("Business").update({
+          stripe_customer_id: customer.id
+        }).eq("id", businessId);
       } catch (e) {
         console.warn("Subscriptions pre-upsert warning:", stringify(e));
       }
@@ -370,6 +373,7 @@ router.post("/payment-sheet", async (req, res) => {
       { apiVersion: MOBILE_API_VERSION }
     );
     const setupIntent = await stripe.setupIntents.create({ customer: customer.id });
+
 
     return res.json({
       customerId: customer.id,
