@@ -8,100 +8,91 @@ const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
-const MOBILE_API_VERSION = "2024-06-20"; // must match @stripe/stripe-react-native
+const MOBILE_API_VERSION = "2024-06-20";
 
-/** ======================= PRICE MAPS (REPLACE THESE) ======================= **
- * IMPORTANT: Use Stripe Price IDs (price_...), NOT product IDs.
- */
-const BASE_PRICE = {
-  starter:    { monthly: "price_starter_month" },
-  growth:     { monthly: "price_growth_month"  },
-  pro:        { monthly: "price_pro_month"     },
-  premium:    { monthly: "price_premium_month" },
-  enterprise: { monthly: "price_enterprise_month" },
+// ======================= CANONICAL TIER PRICES =======================
+// Use *Price IDs* (price_...) if you have them, else fallback to product.default_price
+const TIER_PRICE_REF = {
+  starter:    { priceId: "price_1Rxd4fFb5QGtuTxnswOezQOy", productId: "prod_StPytgt8pMFCRj" },
+  growth:     { priceId: "price_1Rxd71Fb5QGtuTxncCI3eESn", productId: "prod_StPwzSJnzBQ6Zl" },
+  pro:        { priceId: "price_1Rxd7aFb5QGtuTxngC037A0a", productId: "prod_StPxGBl2rarQKt" },
+  premium:    { priceId: "price_1Rxd8HFb5QGtuTxn3soBEWl7", productId: "prod_StPyErvu7yRVYN" },
+  enterprise: { priceId: "price_1Rxd8wFb5QGtuTxnm0iQqR11", productId: "prod_StPytgt8pMFCRj" },
+  // custom: leave unmapped or handle ad-hoc only
 };
-// Add-ons (optional recurring line items)
-const ADDON_DRIVER_MONTH   = "price_addon_driver_month";   // per driver / month
-const ADDON_STOPS100_MONTH = "price_addon_stops100_month"; // per +100 stops / month
-/** ========================================================================= */
+
+// Default add-on unit rates (cents) if client doesn’t send unitCents
+const DEFAULT_ADDONS_BY_TIER = {
+  starter:    { driver: 2500, stops100: 1200 },
+  growth:     { driver: 2000, stops100: 1000 },
+  pro:        { driver: 1800, stops100:  900 },
+  premium:    { driver: 2000, stops100:  900 },
+  enterprise: { driver: 2000, stops100:  700 },
+  custom:     { driver: 2000, stops100:  700 },
+};
 
 const ts = (unix) => (unix ? new Date(unix * 1000) : null);
 const stringify = (e) => {
   if (!e) return "unknown error";
   if (typeof e === "string") return e;
-  if (e.message) return e.message;
+  if (e?.message) return e.message;
   try { return JSON.stringify(e); } catch { return String(e); }
 };
 
-/** =============================== HELPERS ================================ */
-
-async function saveCustomerToBusiness(businessId, stripeCustomerId) {
-  try {
-    const { error } = await supabase
-      .from("Business")
-      .update({ stripe_customer_id: stripeCustomerId, updated_at: new Date() })
-      .eq("id", businessId);
-    if (error) throw error;
-  } catch (err) {
-    // Do not block the flow if Supabase write fails
-    console.warn("saveCustomerToBusiness warning:", stringify(err));
-  }
+// =============================== HELPERS ===============================
+async function loadBusinessRow(businessId) {
+  const { data, error } = await supabase
+    .from("Business")
+    .select("id, stripe_customer_id")
+    .eq("id", businessId)
+    .single();
+  if (error || !data) throw new Error("Business not found");
+  return data;
 }
 
-async function getBusinessByStripeCustomerId(stripeCustomerId) {
-  try {
-    const { data, error } = await supabase
-      .from("Business")
-      .select("id")
-      .eq("stripe_customer_id", stripeCustomerId)
-      .single();
-    if (error) return null;
-    return data;
-  } catch {
-    return null;
+async function resolveTierPriceIdRef(tierId) {
+  const ref = TIER_PRICE_REF[tierId];
+  if (!ref) throw new Error(`Unknown tier '${tierId}'`);
+  if (ref.priceId) return ref.priceId;
+
+  if (ref.productId) {
+    const p = await stripe.products.retrieve(ref.productId, { expand: ["default_price"] });
+    const id = typeof p.default_price === "string" ? p.default_price : p.default_price?.id;
+    if (!id) throw new Error(`Product ${ref.productId} has no default price`);
+    return id;
   }
+  throw new Error(`No price/product mapping for tier '${tierId}'`);
 }
 
-/** Prefer DB → email → create. Never throw here unless Stripe fails. */
 async function getOrCreateCustomer({ businessId, email, userId }) {
-  // 1) DB mapping
-  try {
-    const { data: bizRow } = await supabase
-      .from("Businesses")
-      .select("stripe_customer_id")
-      .eq("id", businessId)
-      .single();
-    if (bizRow?.stripe_customer_id) {
-      const existing = await stripe.customers.retrieve(bizRow.stripe_customer_id);
-      // If deleted or not found, fall through to recreate
-      if (!existing?.deleted) return existing;
-    }
-  } catch (e) {
-    console.warn("getOrCreateCustomer: DB lookup warning:", stringify(e));
+  // prefer existing mapping on Business
+  const biz = await loadBusinessRow(businessId);
+  if (biz.stripe_customer_id) {
+    const c = await stripe.customers.retrieve(biz.stripe_customer_id);
+    if (!c?.deleted) return c;
   }
-
-  // 2) Find by email
+  // search by email
   const found = await stripe.customers.list({ email, limit: 1 });
-  if (found.data.length > 0) {
+  if (found.data[0]) {
     const customer = found.data[0];
-    await saveCustomerToBusiness(businessId, customer.id);
+    await supabase.from("Business").update({
+      stripe_customer_id: customer.id, updated_at: new Date(),
+    }).eq("id", businessId);
     return customer;
   }
-
-  // 3) Create new
-  const created = await stripe.customers.create({
-    email,
-    metadata: { userId, businessId },
-  });
-  await saveCustomerToBusiness(businessId, created.id);
+  // create
+  const created = await stripe.customers.create({ email, metadata: { userId, businessId } });
+  await supabase.from("Business").update({
+    stripe_customer_id: created.id, updated_at: new Date(),
+  }).eq("id", businessId);
   return created;
 }
 
 /** Ensure a default payment method is set. Returns boolean. */
 async function ensureDefaultPM(customerId) {
-  const customer = await stripe.customers.retrieve(customerId);
+  const c = await stripe.customers.retrieve(customerId);
   // @ts-ignore
-  if (customer?.invoice_settings?.default_payment_method) return true;
+  if (c?.invoice_settings?.default_payment_method) return true;
 
   const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
   if (pms.data[0]) {
@@ -113,25 +104,46 @@ async function ensureDefaultPM(customerId) {
   return false;
 }
 
-function mapPlanToItems(plan) {
-  const tierId = String(plan?.tierId || "").trim();
-  const billingMode = String(plan?.billingMode || "").trim(); // 'monthly'|'annual' (map 'annual' if you add it)
-  const basePriceId = BASE_PRICE[tierId]?.[billingMode];
-  if (!basePriceId) {
-    throw new Error("Unknown tierId/billingMode mapping to price");
-  }
+/** Create/reuse a monthly Price for an add-on unit amount, scoped by (kind, businessId, tierId, unit_amount_cents). */
+async function getOrCreateAddonPrice({ kind, unit_amount_cents, businessId, tierId }) {
+  try {
+    const { data } = await supabase
+      .from("StripePriceCache")
+      .select("stripe_price_id")
+      .eq("type", kind)
+      .eq("business_id", businessId)
+      .eq("tier_id", tierId)
+      .eq("unit_amount_cents", unit_amount_cents)
+      .single();
+    if (data?.stripe_price_id) return data.stripe_price_id;
+  } catch {}
 
-  const extraDrivers = Number(plan?.extraDrivers || 0);
-  const extraStopsHundreds = Number(plan?.extraStopsHundreds || 0);
+  const price = await stripe.prices.create({
+    unit_amount: unit_amount_cents,
+    currency: "usd",
+    recurring: { interval: "month" },
+    product_data: {
+      name: kind === "driver" ? "Movaro Driver Add-on" : "Movaro Stops Add-on (per 100)",
+      metadata: { kind, tierId, businessId },
+    },
+    metadata: { kind, tierId, businessId, unit_amount_cents: String(unit_amount_cents) },
+  });
 
-  const items = [{ price: basePriceId, quantity: 1 }];
-  if (extraDrivers > 0) items.push({ price: ADDON_DRIVER_MONTH, quantity: extraDrivers });
-  if (extraStopsHundreds > 0) items.push({ price: ADDON_STOPS100_MONTH, quantity: extraStopsHundreds });
+  try {
+    await supabase.from("StripePriceCache").insert({
+      type: kind,
+      business_id: businessId,
+      tier_id: tierId,
+      unit_amount_cents,
+      stripe_price_id: price.id,
+      created_at: new Date(),
+    });
+  } catch {}
 
-  return { items, extraDrivers, extraStopsHundreds };
+  return price.id;
 }
 
-/** Upsert subscription snapshot into Subscriptions table (by stripe_subscription_id) */
+/** Snapshot the subscription into Subscriptions (upsert by stripe_subscription_id). */
 async function upsertSubscriptionState({
   businessId,
   userId,
@@ -142,8 +154,9 @@ async function upsertSubscriptionState({
   totals,
 }) {
   const totalDrivers = Number(totals?.drivers || 0);
-  const totalStops = Number(totals?.stopsHundreds || 0) * 100;
+  const totalStops   = Number(totals?.stopsHundreds || 0) * 100;
 
+  // Sum unit_amount * quantity (cents)
   const periodAmountCents = (subscription.items?.data || []).reduce(
     (sum, it) => sum + (it.price?.unit_amount || 0) * (it.quantity || 1),
     0
@@ -183,7 +196,7 @@ async function upsertSubscriptionState({
     .eq("stripe_subscription_id", subscription.id)
     .single();
 
-  // Not-found is OK; PostgREST not-found code is PGRST116 (ignore)
+  // Not-found (PGRST116) is fine
   if (findErr && findErr.code !== "PGRST116") throw findErr;
 
   if (existing?.id) {
@@ -204,17 +217,34 @@ async function upsertSubscriptionState({
   }
 }
 
-/** Insert a receipt record for a Stripe.Invoice (first or subsequent) */
-async function insertInitialReceiptIfAny({
+/** (Optional) persist each Stripe subscription item for quick reporting. */
+async function recordSubscriptionItems({ businessId, subscriptionIdLocal, subscription, tierId }) {
+  const items = subscription.items?.data || [];
+  if (!items.length) return;
+  const rows = items.map(it => ({
+    subscription_id: subscriptionIdLocal,
+    business_id: businessId,
+    type: it.price?.metadata?.kind || "base",
+    stripe_price_id: it.price?.id || null,
+    stripe_item_id: it.id || null,
+    quantity: it.quantity || 1,
+    unit_amount_cents: it.price?.unit_amount ?? null,
+    tier_id: tierId,
+    created_at: new Date(),
+  }));
+  try { await supabase.from("SubscriptionItems").insert(rows); } catch {}
+}
+
+/** Insert a receipt row for a Stripe.Invoice into SubscriptionReceipts. */
+async function insertReceiptRow({
   businessId,
   subscriptionId,
   stripeSubscriptionId,
-  invoice,
+  invoice, // Stripe.Invoice with (lines, payment_intent, charges) expanded
 }) {
   if (!invoice) return;
 
-  const piObj =
-    typeof invoice.payment_intent === "object" ? invoice.payment_intent : null;
+  const piObj = typeof invoice.payment_intent === "object" ? invoice.payment_intent : null;
 
   const paymentIntentId =
     typeof invoice.payment_intent === "string"
@@ -226,12 +256,11 @@ async function insertInitialReceiptIfAny({
   const { error } = await supabase.from("SubscriptionReceipts").insert({
     business_id: businessId,
     subscription_id: subscriptionId,
-    stripe_customer_id: invoice.customer,
-    stripe_subscription_id: stripeSubscriptionId,
 
     stripe_invoice_id: invoice.id,
     stripe_payment_intent_id: paymentIntentId,
     stripe_charge_id: charge?.id || null,
+
     billing_reason: invoice.billing_reason || null,
     invoice_status: invoice.status || null,
     payment_intent_status: piObj?.status || null,
@@ -245,19 +274,16 @@ async function insertInitialReceiptIfAny({
       (s, x) => s + (x.amount || 0), 0),
     currency: invoice.currency || "usd",
 
-    period_start:
-      ts(invoice.period_start || invoice.lines?.data?.[0]?.period?.start),
-    period_end:
-      ts(invoice.period_end || invoice.lines?.data?.[0]?.period?.end),
+    period_start: ts(invoice.period_start || invoice.lines?.data?.[0]?.period?.start),
+    period_end: ts(invoice.period_end || invoice.lines?.data?.[0]?.period?.end),
 
     hosted_invoice_url: invoice.hosted_invoice_url || null,
     invoice_pdf_url: invoice.invoice_pdf || null,
     receipt_url: charge?.receipt_url || null,
 
-    payment_method_id:
-      typeof piObj?.payment_method === "string"
-        ? piObj.payment_method
-        : piObj?.payment_method?.id || null,
+    payment_method_id: typeof piObj?.payment_method === "string"
+      ? piObj.payment_method
+      : piObj?.payment_method?.id || null,
     pm_brand: charge?.payment_method_details?.card?.brand || null,
     pm_last4: charge?.payment_method_details?.card?.last4 || null,
     pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
@@ -273,29 +299,43 @@ async function insertInitialReceiptIfAny({
   if (error) throw error;
 }
 
-/** =============================== ROUTES ================================ */
+async function getBusinessByStripeCustomerId(stripeCustomerId) {
+  try {
+    const { data, error } = await supabase
+      .from("Business")
+      .select("id")
+      .eq("stripe_customer_id", stripeCustomerId)
+      .single();
+    if (error) return null;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+// ================================ ROUTES ================================
 
 /**
  * POST /billing/payment-sheet
  * Body: { userId, email, businessId, tier?, paymentAmount?, totalDrivers?, totalStops?, driversLeft?, stopsLeft? }
- * Creates/ensures a Stripe customer, returns PaymentSheet params (ephemeral key + SetupIntent).
- * Optionally inserts a "pending_payment_method" row if tier/paymentAmount provided.
+ * Returns ephemeral key + setup intent for PaymentSheet.
+ * Only creates one "pending_payment_method" Subscriptions row the first time a Stripe customer is attached.
  */
 router.post("/payment-sheet", async (req, res) => {
   try {
     const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body || {};
-
     if (!userId || !email || !businessId) {
       return res.status(400).json({ error: "Missing userId/email/businessId" });
     }
 
-    // ✅ Safer customer creation/lookup
+    const biz = await loadBusinessRow(businessId);
+    const hadCustomer = !!biz.stripe_customer_id;
     const customer = await getOrCreateCustomer({ businessId, email, userId });
 
-    // (Optional) Pre-create a pending row. Never block if it fails.
-    if (tier && paymentAmount != null) {
+    // Only create the "pending" row once (first customer attach). Upsert prevents dupes if raced.
+    if (!hadCustomer && tier && paymentAmount != null) {
       try {
-        const { error } = await supabase.from("Subscriptions").insert({
+        await supabase.from("Subscriptions").upsert({
           business_id: businessId,
           user_id: userId,
           stripe_customer_id: customer.id,
@@ -319,29 +359,17 @@ router.post("/payment-sheet", async (req, res) => {
           metadata: customer.metadata || {},
           created_at: new Date(),
           updated_at: new Date(),
-        });
-        if (error && error.code !== "23505") {
-          console.warn("Subscriptions pre-insert warning:", stringify(error));
-        }
-        const { updateError } = await supabase.from("Business").update({
-          stripe_customer_id: customer.id
-        }).eq("id", businessId);
-        if (updateError) {
-          console.warn("Business update warning:", stringify(updateError));
-        }
+        }, { onConflict: "business_id,status" }); // requires a partial unique index: see SQL below
       } catch (e) {
-        console.warn("Subscriptions pre-insert exception:", stringify(e));
+        console.warn("Subscriptions pre-upsert warning:", stringify(e));
       }
     }
 
-    // Ephemeral key + SetupIntent for PaymentSheet
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: MOBILE_API_VERSION }
     );
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customer.id,
-    });
+    const setupIntent = await stripe.setupIntents.create({ customer: customer.id });
 
     return res.json({
       customerId: customer.id,
@@ -351,16 +379,23 @@ router.post("/payment-sheet", async (req, res) => {
     });
   } catch (err) {
     console.error("payment-sheet error:", err);
-    const msg = stringify(err);
-    return res.status(400).json({ error: msg });
+    return res.status(400).json({ error: stringify(err) });
   }
 });
 
 /**
  * POST /billing/subscribe
- * Body: { userId, businessId, plan: { tierId, billingMode, extraDrivers?, extraStopsHundreds? } }
- * Creates a Stripe subscription (idempotent), upserts your Subscriptions table,
- * and returns PI client secret for the initial invoice if action is required.
+ * Body:
+ * {
+ *   userId, businessId,
+ *   plan: {
+ *     tierId, billingMode: "monthly",
+ *     baseAmountCents?,                 // optional, else canonical tier price
+ *     addons?: [ {kind:"driver"|"stops100", quantity:int, unitCents:int}, ... ],
+ *     notes?: string
+ *   }
+ * }
+ * Creates a subscription with distinct line items, snapshots DB, stores initial receipt.
  */
 router.post("/subscribe", async (req, res) => {
   try {
@@ -368,20 +403,13 @@ router.post("/subscribe", async (req, res) => {
     if (!userId || !businessId || !plan?.tierId || !plan?.billingMode) {
       return res.status(400).json({ error: "Missing userId/businessId/plan fields" });
     }
-
-    // Load business & stripe customer
-    const { data: bizRow, error: bizErr } = await supabase
-      .from("Business")
-      .select("id, stripe_customer_id")
-      .eq("id", businessId)
-      .single();
-
-    if (bizErr || !bizRow?.stripe_customer_id) {
-      return res.status(400).json({ error: "Business or Stripe customer not found" });
+    if (plan.billingMode !== "monthly") {
+      return res.status(400).json({ error: "Only monthly billing is supported right now" });
     }
 
-    // Ensure there's a default PM; if not, tell client to collect card first
-    const hasPM = await ensureDefaultPM(bizRow.stripe_customer_id);
+    const biz = await loadBusinessRow(businessId);
+
+    const hasPM = await ensureDefaultPM(biz.stripe_customer_id);
     if (!hasPM) {
       return res.status(200).json({
         requiresPaymentMethod: true,
@@ -389,66 +417,127 @@ router.post("/subscribe", async (req, res) => {
       });
     }
 
-    // Build items from plan
-    let items, extraDrivers, extraStopsHundreds;
-    try {
-      const mapped = mapPlanToItems(plan);
-      items = mapped.items;
-      extraDrivers = mapped.extraDrivers;
-      extraStopsHundreds = mapped.extraStopsHundreds;
-    } catch (e) {
-      return res.status(400).json({ error: stringify(e) });
+    // ---------- Build subscription items ----------
+    const items = [];
+    let pricingMode = "mapped";
+    const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
+
+    // BASE
+    if (Number.isFinite(plan.baseAmountCents)) {
+      const basePrice = await stripe.prices.create({
+        unit_amount: Math.round(plan.baseAmountCents),
+        currency: "usd",
+        recurring: { interval: "month" },
+        product_data: {
+          name: `Movaro ${plan.tierId} (base)`,
+          metadata: { kind: "base", tierId: plan.tierId, businessId },
+        },
+        metadata: { kind: "base", tierId: plan.tierId, businessId, source: "custom_base" },
+      });
+      items.push({ price: basePrice.id, quantity: 1 });
+      pricingMode = "base_ad_hoc";
+    } else {
+      const tierPriceIdRef = await resolveTierPriceIdRef(plan.tierId);
+      items.push({ price: tierPriceIdRef, quantity: 1 });
+      pricingMode = "mapped";
     }
 
-    // Create subscription (idempotent)
-    const idempotencyKey = `sub:${bizRow.id}:${plan.tierId}:${plan.billingMode}:${extraDrivers}:${extraStopsHundreds}`;
+    // ADD-ONS
+    const normalizedAddons = [];
+    for (const raw of addonsArr) {
+      const kind = String(raw?.kind || "").toLowerCase(); // 'driver' | 'stops100'
+      if (!["driver", "stops100"].includes(kind)) continue;
+      const quantity = Math.max(0, Math.floor(Number(raw?.quantity || 0)));
+      if (!quantity) continue;
+
+      let unitCents = Number.isFinite(raw?.unitCents) ? Math.round(Number(raw.unitCents)) : null;
+      if (!Number.isFinite(unitCents)) {
+        unitCents = DEFAULT_ADDONS_BY_TIER[plan.tierId]?.[kind] ?? 2000;
+      }
+
+      const priceId = await getOrCreateAddonPrice({
+        kind,
+        unit_amount_cents: unitCents,
+        businessId,
+        tierId: plan.tierId,
+      });
+
+      items.push({ price: priceId, quantity });
+      normalizedAddons.push({ kind, quantity, unitCents, priceId });
+    }
+    if (items.length > 1) pricingMode += "_plus_addons";
+
+    // Idempotency is tied to normalized pricing
+    const idempotencyKey = [
+      "sub", businessId, plan.tierId, plan.billingMode, pricingMode,
+      Number(plan.baseAmountCents) || 0,
+      ...normalizedAddons.flatMap(a => [a.kind, a.unitCents, a.quantity]),
+    ].join(":");
+
+    // ---------- Create subscription ----------
     const subscription = await stripe.subscriptions.create(
       {
-        customer: bizRow.stripe_customer_id,
+        customer: biz.stripe_customer_id,
         items,
         payment_settings: { save_default_payment_method: "on_subscription" },
         payment_behavior: "default_incomplete",
         proration_behavior: "create_prorations",
+        metadata: {
+          businessId, userId,
+          tierId: plan.tierId,
+          billingMode: plan.billingMode,
+          pricingMode,
+          baseAmountCents: Number.isFinite(plan.baseAmountCents) ? String(plan.baseAmountCents) : "",
+          addons_json: JSON.stringify(normalizedAddons),
+          notes: plan.notes || "",
+        },
         expand: [
           "latest_invoice.payment_intent",
           "latest_invoice.payment_intent.charges",
           "latest_invoice.lines",
+          "items.data.price",
         ],
       },
       { idempotencyKey }
     );
 
-    // Upsert our subscription state
+    // ---------- Persist state snapshot ----------
+    const totals = {
+      drivers: normalizedAddons.find(a => a.kind === "driver")?.quantity || 0,
+      stopsHundreds: normalizedAddons.find(a => a.kind === "stops100")?.quantity || 0,
+    };
     const subscriptionIdLocal = await upsertSubscriptionState({
-      businessId: bizRow.id,
+      businessId,
       userId,
-      stripeCustomerId: bizRow.stripe_customer_id,
+      stripeCustomerId: biz.stripe_customer_id,
       subscription,
       tier: plan.tierId,
       billingMode: plan.billingMode,
-      totals: { drivers: extraDrivers, stopsHundreds: extraStopsHundreds },
+      totals,
     });
 
-    // Resolve/expand invoice if needed
+    // Optional: store each line item for quick analytics
+    await recordSubscriptionItems({
+      businessId, subscriptionIdLocal, subscription, tierId: plan.tierId,
+    });
+
+    // ---------- Store initial invoice/receipt ----------
     let invoiceObj = null;
     if (subscription.latest_invoice) {
-      if (typeof subscription.latest_invoice === "string") {
-        invoiceObj = await stripe.invoices.retrieve(subscription.latest_invoice, {
-          expand: ["payment_intent", "payment_intent.charges", "lines"],
-        });
-      } else {
-        invoiceObj = subscription.latest_invoice;
-      }
-    }
+      invoiceObj = typeof subscription.latest_invoice === "string"
+        ? await stripe.invoices.retrieve(subscription.latest_invoice, {
+            expand: ["payment_intent", "payment_intent.charges", "lines"],
+          })
+        : subscription.latest_invoice;
 
-    // Insert initial receipt if invoice exists
-    if (invoiceObj) {
-      await insertInitialReceiptIfAny({
-        businessId: bizRow.id,
-        subscriptionId: subscriptionIdLocal,
-        stripeSubscriptionId: subscription.id,
-        invoice: invoiceObj,
-      });
+      if (invoiceObj) {
+        await insertReceiptRow({
+          businessId,
+          subscriptionId: subscriptionIdLocal,
+          stripeSubscriptionId: subscription.id,
+          invoice: invoiceObj,
+        });
+      }
     }
 
     const paymentIntentSecret = invoiceObj?.payment_intent?.client_secret || null;
@@ -459,21 +548,17 @@ router.post("/subscribe", async (req, res) => {
       latestInvoiceId: invoiceObj?.id || null,
       currentPeriodStart: ts(subscription.current_period_start),
       currentPeriodEnd: ts(subscription.current_period_end),
-      paymentIntentClientSecret: paymentIntentSecret, // RN uses this if 3DS is required
+      paymentIntentClientSecret: paymentIntentSecret,
     });
   } catch (err) {
     console.error("subscribe error:", err);
-    return res.status(500).json({
-      error: "subscribe failed",
-      detail: stringify(err),
-    });
+    return res.status(500).json({ error: "subscribe failed", detail: stringify(err) });
   }
 });
 
 /**
  * POST /billing/portal
  * Body: { businessId, returnUrl }
- * Creates a Stripe Customer Billing Portal session.
  */
 router.post("/portal", async (req, res) => {
   try {
@@ -482,18 +567,9 @@ router.post("/portal", async (req, res) => {
       return res.status(400).json({ error: "Missing businessId/returnUrl" });
     }
 
-    const { data: bizRow, error: bizErr } = await supabase
-      .from("Businesses")
-      .select("stripe_customer_id")
-      .eq("id", businessId)
-      .single();
-
-    if (bizErr || !bizRow?.stripe_customer_id) {
-      return res.status(400).json({ error: "Business or Stripe customer not found" });
-    }
-
+    const biz = await loadBusinessRow(businessId);
     const session = await stripe.billingPortal.sessions.create({
-      customer: bizRow.stripe_customer_id,
+      customer: biz.stripe_customer_id,
       return_url: returnUrl,
     });
 
@@ -504,9 +580,9 @@ router.post("/portal", async (req, res) => {
   }
 });
 
-/** ============================ WEBHOOK HANDLER ============================ *
+// ============================ WEBHOOK HANDLER ============================
+/**
  * Wire this in index.js with express.raw:
- *
  *   import bodyParser from 'body-parser';
  *   import billingRouter, { billingWebhook } from './routes/billing.js';
  *   app.use('/billing', billingRouter);
@@ -516,7 +592,7 @@ export async function billingWebhook(req, res) {
   const sig = req.headers["stripe-signature"];
   let event;
   try {
-    const rawBody = req.body ?? req.rawBody;
+    const rawBody = req.body ?? req.rawBody; // express.raw supplies Buffer
     event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error("Webhook signature verification failed:", stringify(err));
@@ -530,9 +606,10 @@ export async function billingWebhook(req, res) {
       case "customer.subscription.deleted": {
         const sub = event.data.object;
 
-        const business =
-          (await getBusinessByStripeCustomerId(sub.customer)) || null;
+        // Map to local business
+        const business = await getBusinessByStripeCustomerId(sub.customer);
 
+        // Preserve userId if we already have the local row
         const { data: localSub } = await supabase
           .from("Subscriptions")
           .select("id, user_id, business_id")
@@ -556,11 +633,26 @@ export async function billingWebhook(req, res) {
           billingMode: "monthly",
           totals: { drivers: 0, stopsHundreds: 0 },
         });
+
+        // Optional: refresh SubscriptionItems on update
+        try {
+          const subscriptionIdLocal = localSub?.id;
+          if (subscriptionIdLocal) {
+            // naive refresh: delete+reinsert
+            await supabase.from("SubscriptionItems").delete().eq("subscription_id", subscriptionIdLocal);
+            await recordSubscriptionItems({
+              businessId, subscriptionIdLocal, subscription: sub, tierId: sub.metadata?.tierId || null,
+            });
+          }
+        } catch {}
+
         break;
       }
+
       case "invoice.payment_succeeded": {
         const inv = event.data.object;
 
+        // Find local subscription
         const { data: localSub } = await supabase
           .from("Subscriptions")
           .select("id, business_id")
@@ -578,7 +670,7 @@ export async function billingWebhook(req, res) {
           break;
         }
 
-        await insertInitialReceiptIfAny({
+        await insertReceiptRow({
           businessId,
           subscriptionId: localSub.id,
           stripeSubscriptionId: inv.subscription,
@@ -589,13 +681,14 @@ export async function billingWebhook(req, res) {
           .from("Subscriptions")
           .update({ last_payment_at: new Date(), updated_at: new Date() })
           .eq("id", localSub.id);
-
         break;
       }
+
       case "invoice.payment_failed": {
         // optional: mark past_due / notify owner
         break;
       }
+
       default:
         break;
     }
