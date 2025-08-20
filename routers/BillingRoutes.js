@@ -8,6 +8,7 @@ const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
+const MOBILE_API_VERSION = "2024-06-20"; // must match @stripe/stripe-react-native
 
 /** ======================= PRICE MAPS (REPLACE THESE) ======================= **
  * IMPORTANT: Use Stripe Price IDs (price_...), NOT product IDs.
@@ -25,40 +26,61 @@ const ADDON_STOPS100_MONTH = "price_addon_stops100_month"; // per +100 stops / m
 /** ========================================================================= */
 
 const ts = (unix) => (unix ? new Date(unix * 1000) : null);
+const stringify = (e) => {
+  if (!e) return "unknown error";
+  if (typeof e === "string") return e;
+  if (e.message) return e.message;
+  try { return JSON.stringify(e); } catch { return String(e); }
+};
 
 /** =============================== HELPERS ================================ */
 
 async function saveCustomerToBusiness(businessId, stripeCustomerId) {
-  const { error } = await supabase
-    .from("Businesses")
-    .update({ stripe_customer_id: stripeCustomerId, updated_at: new Date() })
-    .eq("id", businessId);
-  if (error) throw error;
+  try {
+    const { error } = await supabase
+      .from("Businesses")
+      .update({ stripe_customer_id: stripeCustomerId, updated_at: new Date() })
+      .eq("id", businessId);
+    if (error) throw error;
+  } catch (err) {
+    // Do not block the flow if Supabase write fails
+    console.warn("saveCustomerToBusiness warning:", stringify(err));
+  }
 }
 
 async function getBusinessByStripeCustomerId(stripeCustomerId) {
-  const { data, error } = await supabase
-    .from("Businesses")
-    .select("id")
-    .eq("stripe_customer_id", stripeCustomerId)
-    .single();
-  if (error) return null;
-  return data;
+  try {
+    const { data, error } = await supabase
+      .from("Businesses")
+      .select("id")
+      .eq("stripe_customer_id", stripeCustomerId)
+      .single();
+    if (error) return null;
+    return data;
+  } catch {
+    return null;
+  }
 }
 
+/** Prefer DB → email → create. Never throw here unless Stripe fails. */
 async function getOrCreateCustomer({ businessId, email, userId }) {
-  // Prefer DB mapping first
-  const { data: bizRow } = await supabase
-    .from("Businesses")
-    .select("stripe_customer_id")
-    .eq("id", businessId)
-    .single();
-
-  if (bizRow?.stripe_customer_id) {
-    return await stripe.customers.retrieve(bizRow.stripe_customer_id);
+  // 1) DB mapping
+  try {
+    const { data: bizRow } = await supabase
+      .from("Businesses")
+      .select("stripe_customer_id")
+      .eq("id", businessId)
+      .single();
+    if (bizRow?.stripe_customer_id) {
+      const existing = await stripe.customers.retrieve(bizRow.stripe_customer_id);
+      // If deleted or not found, fall through to recreate
+      if (!existing?.deleted) return existing;
+    }
+  } catch (e) {
+    console.warn("getOrCreateCustomer: DB lookup warning:", stringify(e));
   }
 
-  // Fallback: try finding by email
+  // 2) Find by email
   const found = await stripe.customers.list({ email, limit: 1 });
   if (found.data.length > 0) {
     const customer = found.data[0];
@@ -66,7 +88,7 @@ async function getOrCreateCustomer({ businessId, email, userId }) {
     return customer;
   }
 
-  // Create new
+  // 3) Create new
   const created = await stripe.customers.create({
     email,
     metadata: { userId, businessId },
@@ -78,7 +100,7 @@ async function getOrCreateCustomer({ businessId, email, userId }) {
 /** Ensure a default payment method is set. Returns boolean. */
 async function ensureDefaultPM(customerId) {
   const customer = await stripe.customers.retrieve(customerId);
-  // @ts-ignore (Stripe type)
+  // @ts-ignore
   if (customer?.invoice_settings?.default_payment_method) return true;
 
   const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
@@ -93,7 +115,7 @@ async function ensureDefaultPM(customerId) {
 
 function mapPlanToItems(plan) {
   const tierId = String(plan?.tierId || "").trim();
-  const billingMode = String(plan?.billingMode || "").trim(); // 'monthly'|'annual' (you only mapped monthly above)
+  const billingMode = String(plan?.billingMode || "").trim(); // 'monthly'|'annual' (map 'annual' if you add it)
   const basePriceId = BASE_PRICE[tierId]?.[billingMode];
   if (!basePriceId) {
     throw new Error("Unknown tierId/billingMode mapping to price");
@@ -161,7 +183,7 @@ async function upsertSubscriptionState({
     .eq("stripe_subscription_id", subscription.id)
     .single();
 
-  // Not-found code is OK
+  // Not-found is OK; PostgREST not-found code is PGRST116 (ignore)
   if (findErr && findErr.code !== "PGRST116") throw findErr;
 
   if (existing?.id) {
@@ -185,9 +207,9 @@ async function upsertSubscriptionState({
 /** Insert a receipt record for a Stripe.Invoice (first or subsequent) */
 async function insertInitialReceiptIfAny({
   businessId,
-  subscriptionId, // local Subscriptions.id (UUID)
+  subscriptionId,
   stripeSubscriptionId,
-  invoice, // Stripe.Invoice
+  invoice,
 }) {
   if (!invoice) return;
 
@@ -220,9 +242,7 @@ async function insertInitialReceiptIfAny({
     subtotal_cents: invoice.subtotal || 0,
     tax_cents: invoice.tax || 0,
     discount_total_cents: (invoice.total_discount_amounts || []).reduce(
-      (s, x) => s + (x.amount || 0),
-      0
-    ),
+      (s, x) => s + (x.amount || 0), 0),
     currency: invoice.currency || "usd",
 
     period_start:
@@ -263,78 +283,70 @@ async function insertInitialReceiptIfAny({
  */
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body;
+    const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body || {};
 
     if (!userId || !email || !businessId) {
       return res.status(400).json({ error: "Missing userId/email/businessId" });
     }
 
-    // 1) Ensure Stripe Customer
-    let customer;
-    const existing = await stripe.customers.list({ email, limit: 1 });
-    if (existing.data.length > 0) {
-      customer = existing.data[0];
-    } else {
-      customer = await stripe.customers.create({
-        email,
-        metadata: { userId, businessId },
-      });
-    }
+    // ✅ Safer customer creation/lookup
+    const customer = await getOrCreateCustomer({ businessId, email, userId });
 
-    // 2) Persist customer on the business record (optional but recommended)
-    await saveCustomerToBusiness(businessId, customer.id);
-
-    // 3) (Optional) Pre-create a "pending" subscription snapshot for your UI
-    //    If you prefer, you can skip this and only insert after Stripe subscription is created.
+    // (Optional) Pre-create a pending row. Never block if it fails.
     if (tier && paymentAmount != null) {
-      // Mark as pending_payment_method (not active yet)
-      const { error } = await supabase.from("Subscriptions").insert({
-        business_id: businessId,
-        user_id: userId,
-        stripe_customer_id: customer.id,
-        stripe_subscription_id: null,
-        tier,
-        billing_mode: "monthly",
-        payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0, // ensure cents if you passed USD
-        currency: "usd",
-        total_drivers: Number(totalDrivers || 0),
-        drivers_left: Number(driversLeft || totalDrivers || 0),
-        total_stops: Number(totalStops || 0),
-        stops_left: Number(stopsLeft || totalStops || 0),
-        status: "pending_payment_method",
-        last_payment_at: null,
-        current_period_start: new Date(),
-        current_period_end: null, // will be set after subscription creation
-        cancel_at_period_end: false,
-        canceled_at: null,
-        default_payment_method_id: null,
-        latest_invoice_id: null,
-        metadata: customer.metadata || {},
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
-      if (error && error.code !== "23505") { // ignore unique conflicts if you call twice
-        // log but don't block the sheet
-        console.warn("Subscriptions pre-insert warning:", error);
+      try {
+        const { error } = await supabase.from("Subscriptions").insert({
+          business_id: businessId,
+          user_id: userId,
+          stripe_customer_id: customer.id,
+          stripe_subscription_id: null,
+          tier,
+          billing_mode: "monthly",
+          payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0,
+          currency: "usd",
+          total_drivers: Number(totalDrivers || 0),
+          drivers_left: Number(driversLeft || totalDrivers || 0),
+          total_stops: Number(totalStops || 0),
+          stops_left: Number(stopsLeft || totalStops || 0),
+          status: "pending_payment_method",
+          last_payment_at: null,
+          current_period_start: new Date(),
+          current_period_end: null,
+          cancel_at_period_end: false,
+          canceled_at: null,
+          default_payment_method_id: null,
+          latest_invoice_id: null,
+          metadata: customer.metadata || {},
+          created_at: new Date(),
+          updated_at: new Date(),
+        });
+        if (error && error.code !== "23505") {
+          console.warn("Subscriptions pre-insert warning:", stringify(error));
+        }
+      } catch (e) {
+        console.warn("Subscriptions pre-insert exception:", stringify(e));
       }
     }
 
-    // 4) PaymentSheet: Ephemeral Key + SetupIntent
+    // Ephemeral key + SetupIntent for PaymentSheet
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
-      { apiVersion: "2024-06-20" }
+      { apiVersion: MOBILE_API_VERSION }
     );
-    const setupIntent = await stripe.setupIntents.create({ customer: customer.id });
+    const setupIntent = await stripe.setupIntents.create({
+      customer: customer.id,
+    });
 
-    res.json({
+    return res.json({
       customerId: customer.id,
       ephemeralKey: ephemeralKey.secret,
       setupIntentClientSecret: setupIntent.client_secret,
       merchantCountryCode: "US",
     });
   } catch (err) {
-    console.error("payment-sheet error", err);
-    res.status(400).json({ error: err.message });
+    console.error("payment-sheet error:", err);
+    const msg = stringify(err);
+    return res.status(400).json({ error: msg });
   }
 });
 
@@ -348,9 +360,7 @@ router.post("/subscribe", async (req, res) => {
   try {
     const { userId, businessId, plan } = req.body || {};
     if (!userId || !businessId || !plan?.tierId || !plan?.billingMode) {
-      return res
-        .status(400)
-        .json({ error: "Missing userId/businessId/plan fields" });
+      return res.status(400).json({ error: "Missing userId/businessId/plan fields" });
     }
 
     // Load business & stripe customer
@@ -361,9 +371,7 @@ router.post("/subscribe", async (req, res) => {
       .single();
 
     if (bizErr || !bizRow?.stripe_customer_id) {
-      return res
-        .status(400)
-        .json({ error: "Business or Stripe customer not found" });
+      return res.status(400).json({ error: "Business or Stripe customer not found" });
     }
 
     // Ensure there's a default PM; if not, tell client to collect card first
@@ -371,16 +379,23 @@ router.post("/subscribe", async (req, res) => {
     if (!hasPM) {
       return res.status(200).json({
         requiresPaymentMethod: true,
-        message:
-          "No default payment method found. Collect a card with PaymentSheet, then retry.",
+        message: "No default payment method found. Collect a card with PaymentSheet, then retry.",
       });
     }
 
     // Build items from plan
-    const { items, extraDrivers, extraStopsHundreds } = mapPlanToItems(plan);
+    let items, extraDrivers, extraStopsHundreds;
+    try {
+      const mapped = mapPlanToItems(plan);
+      items = mapped.items;
+      extraDrivers = mapped.extraDrivers;
+      extraStopsHundreds = mapped.extraStopsHundreds;
+    } catch (e) {
+      return res.status(400).json({ error: stringify(e) });
+    }
 
     // Create subscription (idempotent)
-    const idempotencyKey = `sub:${bizRow.id}:${plan.tierId}:${plan.billingMode}`;
+    const idempotencyKey = `sub:${bizRow.id}:${plan.tierId}:${plan.billingMode}:${extraDrivers}:${extraStopsHundreds}`;
     const subscription = await stripe.subscriptions.create(
       {
         customer: bizRow.stripe_customer_id,
@@ -412,12 +427,9 @@ router.post("/subscribe", async (req, res) => {
     let invoiceObj = null;
     if (subscription.latest_invoice) {
       if (typeof subscription.latest_invoice === "string") {
-        invoiceObj = await stripe.invoices.retrieve(
-          subscription.latest_invoice,
-          {
-            expand: ["payment_intent", "payment_intent.charges", "lines"],
-          }
-        );
+        invoiceObj = await stripe.invoices.retrieve(subscription.latest_invoice, {
+          expand: ["payment_intent", "payment_intent.charges", "lines"],
+        });
       } else {
         invoiceObj = subscription.latest_invoice;
       }
@@ -433,8 +445,7 @@ router.post("/subscribe", async (req, res) => {
       });
     }
 
-    const paymentIntentSecret =
-      invoiceObj?.payment_intent?.client_secret || null;
+    const paymentIntentSecret = invoiceObj?.payment_intent?.client_secret || null;
 
     return res.json({
       subscriptionId: subscription.id,
@@ -445,10 +456,10 @@ router.post("/subscribe", async (req, res) => {
       paymentIntentClientSecret: paymentIntentSecret, // RN uses this if 3DS is required
     });
   } catch (err) {
-    console.error("subscribe error", err);
+    console.error("subscribe error:", err);
     return res.status(500).json({
       error: "subscribe failed",
-      detail: String(err?.message || err),
+      detail: stringify(err),
     });
   }
 });
@@ -472,9 +483,7 @@ router.post("/portal", async (req, res) => {
       .single();
 
     if (bizErr || !bizRow?.stripe_customer_id) {
-      return res
-        .status(400)
-        .json({ error: "Business or Stripe customer not found" });
+      return res.status(400).json({ error: "Business or Stripe customer not found" });
     }
 
     const session = await stripe.billingPortal.sessions.create({
@@ -485,7 +494,7 @@ router.post("/portal", async (req, res) => {
     return res.json({ url: session.url });
   } catch (err) {
     console.error("portal error", err);
-    return res.status(500).json({ error: "portal failed", detail: err.message });
+    return res.status(500).json({ error: "portal failed", detail: stringify(err) });
   }
 });
 
@@ -501,16 +510,11 @@ export async function billingWebhook(req, res) {
   const sig = req.headers["stripe-signature"];
   let event;
   try {
-    // If index.js used express.raw, req.body is a Buffer
     const rawBody = req.body ?? req.rawBody;
-    event = stripe.webhooks.constructEvent(
-      rawBody,
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
-    console.error("Webhook signature verification failed:", err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+    console.error("Webhook signature verification failed:", stringify(err));
+    return res.status(400).send(`Webhook Error: ${stringify(err)}`);
   }
 
   try {
@@ -520,11 +524,9 @@ export async function billingWebhook(req, res) {
       case "customer.subscription.deleted": {
         const sub = event.data.object;
 
-        // Find local business & existing local subscription row
         const business =
           (await getBusinessByStripeCustomerId(sub.customer)) || null;
 
-        // Try to keep userId if we already have a row
         const { data: localSub } = await supabase
           .from("Subscriptions")
           .select("id, user_id, business_id")
@@ -535,7 +537,6 @@ export async function billingWebhook(req, res) {
         const businessId = localSub?.business_id ?? business?.id ?? null;
 
         if (!businessId) {
-          // We can't map it—log and continue
           console.warn("No businessId found for subscription", sub.id);
           break;
         }
@@ -545,24 +546,21 @@ export async function billingWebhook(req, res) {
           userId,
           stripeCustomerId: sub.customer,
           subscription: sub,
-          tier: sub.items?.data?.[0]?.price?.nickname || null, // optional
-          billingMode: "monthly", // adjust if you support annual
-          totals: { drivers: 0, stopsHundreds: 0 }, // unknown from webhook alone
+          tier: sub.items?.data?.[0]?.price?.nickname || null,
+          billingMode: "monthly",
+          totals: { drivers: 0, stopsHundreds: 0 },
         });
-
         break;
       }
       case "invoice.payment_succeeded": {
         const inv = event.data.object;
 
-        // Find local row by stripe_subscription_id
         const { data: localSub } = await supabase
           .from("Subscriptions")
           .select("id, business_id")
           .eq("stripe_subscription_id", inv.subscription)
           .single();
 
-        // Fallback: map business by customer if needed
         let businessId = localSub?.business_id || null;
         if (!businessId) {
           const biz = await getBusinessByStripeCustomerId(inv.customer);
@@ -570,14 +568,10 @@ export async function billingWebhook(req, res) {
         }
 
         if (!businessId || !localSub?.id) {
-          console.warn(
-            "invoice.payment_succeeded: could not map local subscription/business",
-            inv.id
-          );
+          console.warn("invoice.payment_succeeded: cannot map local subscription/business", inv.id);
           break;
         }
 
-        // Insert/append receipt
         await insertInitialReceiptIfAny({
           businessId,
           subscriptionId: localSub.id,
@@ -585,19 +579,15 @@ export async function billingWebhook(req, res) {
           invoice: inv,
         });
 
-        // Mark last_payment_at on Subscriptions
         await supabase
           .from("Subscriptions")
-          .update({
-            last_payment_at: new Date(),
-            updated_at: new Date(),
-          })
+          .update({ last_payment_at: new Date(), updated_at: new Date() })
           .eq("id", localSub.id);
 
         break;
       }
       case "invoice.payment_failed": {
-        // You can mark the subscription as past_due or notify the business owner
+        // optional: mark past_due / notify owner
         break;
       }
       default:
@@ -606,7 +596,7 @@ export async function billingWebhook(req, res) {
 
     return res.json({ received: true });
   } catch (e) {
-    console.error("Webhook processing error:", e);
+    console.error("Webhook processing error:", stringify(e));
     return res.status(500).json({ error: "webhook failure" });
   }
 }
