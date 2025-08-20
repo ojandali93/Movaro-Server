@@ -771,6 +771,7 @@ router.post("/customers", async (req, res) => {
           .from("Business")
           .update({
             stripe_customer_id: customer.id,
+            address,
             updated_at: new Date(),
           })
           .eq("id", businessId);
