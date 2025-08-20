@@ -371,7 +371,7 @@ router.post("/subscribe", async (req, res) => {
 
     // Load business & stripe customer
     const { data: bizRow, error: bizErr } = await supabase
-      .from("Businesses")
+      .from("Business")
       .select("id, stripe_customer_id")
       .eq("id", businessId)
       .single();
