@@ -323,6 +323,12 @@ router.post("/payment-sheet", async (req, res) => {
         if (error && error.code !== "23505") {
           console.warn("Subscriptions pre-insert warning:", stringify(error));
         }
+        const { updateError } = await supabase.from("Business").update({
+          stripe_customer_id: customer.id
+        }).eq("id", businessId);
+        if (updateError) {
+          console.warn("Business update warning:", stringify(updateError));
+        }
       } catch (e) {
         console.warn("Subscriptions pre-insert exception:", stringify(e));
       }
