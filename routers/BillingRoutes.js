@@ -29,11 +29,12 @@ router.post("/payment-sheet", async (req, res) => {
   try {
     const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body;
 
+    console.log('req.body: ', JSON.stringify(req.body, null, 2));
+
     // Ensure a Stripe Customer exists for this user
     let customer;
     const existing = await stripe.customers.list({ email, limit: 1 });
     if (existing.data.length > 0) {
-      console.log('existing: ', JSON.stringify(existing, null, 2));
       customer = existing.data[0];
     } else {
       customer = await stripe.customers.create({
