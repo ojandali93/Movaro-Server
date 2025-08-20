@@ -671,6 +671,147 @@ router.post("/portal", async (req, res) => {
   }
 });
 
+// NEW: Create (or reuse) a Stripe customer for a business
+//
+// POST /billing/customers
+// Body (min):
+// {
+//   "name": "Movaro LLC",
+//   "email": "owner@movaro.com"
+// }
+//
+// Optional extras you can include:
+// {
+//   "businessId": 123,                 // to map & persist stripe_customer_id on Business
+//   "phone": "+1-555-123-4567",
+//   "address": {                       // Stripe address shape
+//     "line1": "123 Main St",
+//     "line2": "Suite 400",
+//     "city": "San Francisco",
+//     "state": "CA",
+//     "postal_code": "94107",
+//     "country": "US"
+//   },
+//   "shipping": {                      // Stripe shipping shape
+//     "name": "Movaro LLC",
+//     "phone": "+1-555-123-4567",
+//     "address": { ...same as above }
+//   },
+//   "preferred_locales": ["en-US"],
+//   "tax_exempt": "none",              // "none" | "exempt" | "reverse"
+//   "metadata": { "source": "dashboard" },
+//   "forceNew": false                  // if true, always create a new Stripe customer
+// }
+//
+// Response:
+// { customerId, customer, savedToBusiness }
+router.post("/customers", async (req, res) => {
+  try {
+    const {
+      name,
+      email,
+      businessId,
+      phone,
+      address,
+      metadata,
+      forceNew,
+    } = req.body || {};
+
+    if (!name || !email) {
+      return res.status(400).json({ error: "Missing required fields: name, email" });
+    }
+
+    // 1) Try to reuse an existing Stripe Customer (unless forceNew)
+    let customer = null;
+    if (!forceNew) {
+      try {
+        const found = await stripe.customers.list({ email, limit: 1 });
+        if (found.data[0]) {
+          customer = found.data[0];
+          // Optionally "freshen" basic fields you provided
+          const toUpdate = {};
+          if (name && customer.name !== name) toUpdate.name = name;
+          if (phone && customer.phone !== phone) toUpdate.phone = phone;
+          if (address) toUpdate.address = address;
+          if (address) toUpdate.shipping = address;
+          if (metadata && typeof metadata === "object") {
+            toUpdate.metadata = { ...(customer.metadata || {}), ...metadata };
+          }
+          if (Object.keys(toUpdate).length > 0) {
+            customer = await stripe.customers.update(customer.id, toUpdate);
+          }
+        }
+      } catch (e) {
+        console.warn("Stripe customers.list warning:", e?.message || String(e));
+      }
+    }
+
+    // 2) Create a new Stripe Customer if we didn't reuse one
+    if (!customer) {
+      const createParams = {
+        name,
+        email,
+        ...(phone ? { phone } : {}),
+        ...(address ? { address } : {}),
+        ...(address ? { shipping: address } : {}),
+        metadata: {
+          ...(typeof metadata === "object" ? metadata : {}),
+          ...(businessId ? { businessId: String(businessId) } : {}),
+          businessName: name,
+        },
+      };
+      // Use an idempotency key to avoid dupes if retried
+      const idemKey = `cust:${businessId || email}:${name}`;
+      customer = await stripe.customers.create(createParams, { idempotencyKey: idemKey });
+    }
+
+    // 3) If a Business id was supplied, persist the mapping (idempotent)
+    let savedToBusiness = false;
+    if (businessId) {
+      try {
+        const { error: updErr } = await supabase
+          .from("Business")
+          .update({
+            stripe_customer_id: customer.id,
+            updated_at: new Date(),
+          })
+          .eq("id", businessId);
+        if (updErr) {
+          console.warn("Business update warning:", updErr);
+        } else {
+          savedToBusiness = true;
+        }
+      } catch (e) {
+        console.warn("Business update exception:", e?.message || String(e));
+      }
+    }
+
+    // 4) Return a slimmed customer object
+    const clean = (c) => ({
+      id: c.id,
+      name: c.name || null,
+      email: c.email || null,
+      phone: c.phone || null,
+      address: c.address || null,
+      shipping: c.shipping || null,
+      preferred_locales: c.preferred_locales || null,
+      tax_exempt: c.tax_exempt || "none",
+      metadata: c.metadata || {},
+      created: c.created ? new Date(c.created * 1000) : null,
+    });
+
+    return res.json({
+      customerId: customer.id,
+      customer: clean(customer),
+      savedToBusiness,
+    });
+  } catch (err) {
+    console.error("create-customer error:", err);
+    return res.status(500).json({ error: "create-customer failed", detail: err?.message || String(err) });
+  }
+});
+
+
 // ============================ WEBHOOK HANDLER ============================
 /**
  * Wire this in index.js with express.raw:
