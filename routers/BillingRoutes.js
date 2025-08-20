@@ -217,6 +217,32 @@ async function upsertSubscriptionState({
   }
 }
 
+async function getOrCreateCustomerNoWrite({ businessId, email, userId }) {
+  // 1) If Business already mapped, reuse it (no write)
+  try {
+    const { data: biz } = await supabase
+      .from("Business")
+      .select("stripe_customer_id")
+      .eq("id", businessId)
+      .single();
+    if (biz?.stripe_customer_id) {
+      const c = await stripe.customers.retrieve(biz.stripe_customer_id);
+      if (!c?.deleted) return { customer: c, wasNew: false };
+    }
+  } catch {}
+
+  // 2) Try by email (no write)
+  const found = await stripe.customers.list({ email, limit: 1 });
+  if (found.data[0]) return { customer: found.data[0], wasNew: false };
+
+  // 3) Create (no write to Business yet)
+  const created = await stripe.customers.create({
+    email,
+    metadata: { userId, businessId },
+  });
+  return { customer: created, wasNew: true };
+}
+
 /** (Optional) persist each Stripe subscription item for quick reporting. */
 async function recordSubscriptionItems({ businessId, subscriptionIdLocal, subscription, tierId }) {
   const items = subscription.items?.data || [];
@@ -323,19 +349,45 @@ async function getBusinessByStripeCustomerId(stripeCustomerId) {
  */
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body || {};
+    const {
+      userId, email, businessId,
+      tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft
+    } = req.body || {};
+
     if (!userId || !email || !businessId) {
       return res.status(400).json({ error: "Missing userId/email/businessId" });
     }
 
-    const biz = await loadBusinessRow(businessId);
-    const hadCustomer = !!biz.stripe_customer_id;
-    const customer = await getOrCreateCustomer({ businessId, email, userId });
+    // Snapshot current business state BEFORE we touch Stripe
+    const { data: biz, error: bizErr } = await supabase
+      .from("Business")
+      .select("id, stripe_customer_id")
+      .eq("id", businessId)
+      .single();
+    if (bizErr || !biz) return res.status(400).json({ error: "Business not found" });
 
-    // Only create the "pending" row once (first customer attach). Upsert prevents dupes if raced.
-    if (!hadCustomer && tier && paymentAmount != null) {
+    const hadCustomer = !!biz.stripe_customer_id;
+    console.log("hadCustomer", hadCustomer);
+
+    // Create or reuse a Stripe customer, but DO NOT write to Business yet
+    const { customer } = await getOrCreateCustomerNoWrite({ businessId, email, userId });
+
+    // Should we insert a pending row?
+    // Rule: insert iff this business has NO Subscriptions row at all yet.
+    let mustInsertPending = false;
+    if (tier && paymentAmount != null) {
+      const { data: anySub, error: subErr } = await supabase
+        .from("Subscriptions")
+        .select("id")
+        .eq("business_id", businessId)
+        .limit(1);
+      if (subErr) console.warn("Subscriptions existence check warning:", stringify(subErr));
+      mustInsertPending = !(anySub && anySub.length > 0);
+    }
+
+    if (mustInsertPending) {
       try {
-        await supabase.from("Subscriptions").upsert({
+        await supabase.from("Subscriptions").insert({
           business_id: businessId,
           user_id: userId,
           stripe_customer_id: customer.id,
@@ -359,21 +411,30 @@ router.post("/payment-sheet", async (req, res) => {
           metadata: customer.metadata || {},
           created_at: new Date(),
           updated_at: new Date(),
-        }, { onConflict: "business_id,status" }); // requires a partial unique index: see SQL below
-        await supabase.from("Business").update({
-          stripe_customer_id: customer.id
-        }).eq("id", businessId);
+        });
       } catch (e) {
-        console.warn("Subscriptions pre-upsert warning:", stringify(e));
+        // ignore unique violation in a race
+        if (e?.code !== "23505") {
+          console.warn("Subscriptions pre-insert warning:", stringify(e));
+        }
       }
     }
 
+    // Now, idempotently persist the customer on Business (only if missing or mismatched)
+    if (!hadCustomer || biz.stripe_customer_id !== customer.id) {
+      const { error: updErr } = await supabase
+        .from("Business")
+        .update({ stripe_customer_id: customer.id, updated_at: new Date() })
+        .eq("id", businessId);
+      if (updErr) console.warn("Business update warning:", stringify(updErr));
+    }
+
+    // Stripe ephemeral key + setup intent for card collection
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: MOBILE_API_VERSION }
     );
     const setupIntent = await stripe.setupIntents.create({ customer: customer.id });
-
 
     return res.json({
       customerId: customer.id,
