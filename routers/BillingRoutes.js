@@ -386,6 +386,7 @@ router.post("/payment-sheet", async (req, res) => {
     }
 
     if (mustInsertPending) {
+      console.log("mustInsertPending", mustInsertPending);
       try {
         await supabase.from("Subscriptions").insert({
           business_id: businessId,
@@ -412,6 +413,8 @@ router.post("/payment-sheet", async (req, res) => {
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         });
+        console.log("customer", customer.id);
+        console.log("businessId", businessId);
         await supabase
           .from("Business")
           .update({ stripe_customer_id: customer.id, updated_at: new Date().toISOString() })
