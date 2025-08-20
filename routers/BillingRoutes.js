@@ -263,72 +263,70 @@ async function insertInitialReceiptIfAny({
  */
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const {
-      userId,
-      email,
-      businessId,
-      tier,
-      paymentAmount,
-      totalDrivers,
-      totalStops,
-      driversLeft,
-      stopsLeft,
-    } = req.body || {};
+    const { userId, email, businessId, tier, paymentAmount, totalDrivers, totalStops, driversLeft, stopsLeft } = req.body;
 
     if (!userId || !email || !businessId) {
       return res.status(400).json({ error: "Missing userId/email/businessId" });
     }
 
-    // Ensure customer
-    const customer = await getOrCreateCustomer({ businessId, email, userId });
+    // 1) Ensure Stripe Customer
+    let customer;
+    const existing = await stripe.customers.list({ email, limit: 1 });
+    if (existing.data.length > 0) {
+      customer = existing.data[0];
+    } else {
+      customer = await stripe.customers.create({
+        email,
+        metadata: { userId, businessId },
+      });
+    }
 
-    // (Optional) Pre-insert a pending row for UI purposes
+    // 2) Persist customer on the business record (optional but recommended)
+    await saveCustomerToBusiness(businessId, customer.id);
+
+    // 3) (Optional) Pre-create a "pending" subscription snapshot for your UI
+    //    If you prefer, you can skip this and only insert after Stripe subscription is created.
     if (tier && paymentAmount != null) {
-      const { error } = await supabase
-        .from("Subscriptions")
-        .insert({
-          business_id: businessId,
-          user_id: userId,
-          stripe_customer_id: customer.id,
-          stripe_subscription_id: null,
-          tier,
-          billing_mode: "monthly",
-          payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0,
-          currency: "usd",
-          total_drivers: Number(totalDrivers || 0),
-          drivers_left: Number(driversLeft || totalDrivers || 0),
-          total_stops: Number(totalStops || 0),
-          stops_left: Number(stopsLeft || totalStops || 0),
-          status: "pending_payment_method",
-          last_payment_at: null,
-          current_period_start: new Date(),
-          current_period_end: null,
-          cancel_at_period_end: false,
-          canceled_at: null,
-          default_payment_method_id: null,
-          latest_invoice_id: null,
-          metadata: customer.metadata || {},
-          created_at: new Date(),
-          updated_at: new Date(),
-        })
-        .select("id")
-        .single();
-      // ignore unique conflicts if you call twice
-      if (error && error.code !== "23505") {
+      // Mark as pending_payment_method (not active yet)
+      const { error } = await supabase.from("Subscriptions").insert({
+        business_id: businessId,
+        user_id: userId,
+        stripe_customer_id: customer.id,
+        stripe_subscription_id: null,
+        tier,
+        billing_mode: "monthly",
+        payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0, // ensure cents if you passed USD
+        currency: "usd",
+        total_drivers: Number(totalDrivers || 0),
+        drivers_left: Number(driversLeft || totalDrivers || 0),
+        total_stops: Number(totalStops || 0),
+        stops_left: Number(stopsLeft || totalStops || 0),
+        status: "pending_payment_method",
+        last_payment_at: null,
+        current_period_start: new Date(),
+        current_period_end: null, // will be set after subscription creation
+        cancel_at_period_end: false,
+        canceled_at: null,
+        default_payment_method_id: null,
+        latest_invoice_id: null,
+        metadata: customer.metadata || {},
+        created_at: new Date(),
+        updated_at: new Date(),
+      });
+      if (error && error.code !== "23505") { // ignore unique conflicts if you call twice
+        // log but don't block the sheet
         console.warn("Subscriptions pre-insert warning:", error);
       }
     }
 
-    // Ephemeral key + SetupIntent for PaymentSheet
+    // 4) PaymentSheet: Ephemeral Key + SetupIntent
     const ephemeralKey = await stripe.ephemeralKeys.create(
       { customer: customer.id },
       { apiVersion: "2024-06-20" }
     );
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customer.id,
-    });
+    const setupIntent = await stripe.setupIntents.create({ customer: customer.id });
 
-    return res.json({
+    res.json({
       customerId: customer.id,
       ephemeralKey: ephemeralKey.secret,
       setupIntentClientSecret: setupIntent.client_secret,
@@ -336,7 +334,7 @@ router.post("/payment-sheet", async (req, res) => {
     });
   } catch (err) {
     console.error("payment-sheet error", err);
-    return res.status(400).json({ error: err.message });
+    res.status(400).json({ error: err.message });
   }
 });
 
