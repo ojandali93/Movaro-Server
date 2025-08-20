@@ -38,7 +38,7 @@ const stringify = (e) => {
 async function saveCustomerToBusiness(businessId, stripeCustomerId) {
   try {
     const { error } = await supabase
-      .from("Businesses")
+      .from("Business")
       .update({ stripe_customer_id: stripeCustomerId, updated_at: new Date() })
       .eq("id", businessId);
     if (error) throw error;
@@ -51,7 +51,7 @@ async function saveCustomerToBusiness(businessId, stripeCustomerId) {
 async function getBusinessByStripeCustomerId(stripeCustomerId) {
   try {
     const { data, error } = await supabase
-      .from("Businesses")
+      .from("Business")
       .select("id")
       .eq("stripe_customer_id", stripeCustomerId)
       .single();
