@@ -42,6 +42,39 @@ router.post("/payment-sheet", async (req, res) => {
         metadata: { userId },
       });
       console.log('customer: ', JSON.stringify(customer, null, 2));
+      let currentPeriodEnd = new Date();
+      currentPeriodEnd.setMonth(currentPeriodEnd.getMonth() + 1);
+      const storedPayment = await supabase
+        .from('Subscriptions')
+        .insert({
+          business_id: businessId,
+          user_id: userId,
+          stripe_customer_id: customer.id,
+          stripe_subscription_id: null,
+          tier,
+          billing_mode: 'monthly',
+          payment_amount_cents: paymentAmount,
+          currency: 'usd',
+          total_drivers: totalDrivers,
+          total_stops: totalStops,
+          drivers_left: driversLeft,
+          stops_left: stopsLeft,
+          status: 'active',
+          last_payment_at: new Date(),
+          current_period_start: new Date(),
+          current_period_end: currentPeriodEnd,
+          cancel_at_period_end: false,
+          canceled_at: null,
+          default_payment_method_id: null,
+          latest_invoice_id: null,
+          metadata: customer.metadata,
+          delinquent: customer.delinquent,
+          created_at: new Date(),
+        })
+        .select()
+        .single();
+
+      console.log('storedPayment: ', JSON.stringify(storedPayment, null, 2));
     }
 
     // Create an ephemeral key for the client
@@ -55,40 +88,6 @@ router.post("/payment-sheet", async (req, res) => {
       customer: customer.id,
     });
 
-    let currentPeriodEnd = new Date();
-    currentPeriodEnd.setMonth(currentPeriodEnd.getMonth() + 1);
-
-    const storedPayment = await supabase
-      .from('Subscriptions')
-      .insert({
-        business_id: businessId,
-        user_id: userId,
-        stripe_customer_id: customer.id,
-        stripe_subscription_id: null,
-        tier,
-        billing_mode: 'monthly',
-        payment_amount_cents: paymentAmount,
-        currency: 'usd',
-        total_drivers: totalDrivers,
-        total_stops: totalStops,
-        drivers_left: driversLeft,
-        stops_left: stopsLeft,
-        status: 'active',
-        last_payment_at: new Date(),
-        current_period_start: new Date(),
-        current_period_end: currentPeriodEnd,
-        cancel_at_period_end: false,
-        canceled_at: null,
-        default_payment_method_id: null,
-        latest_invoice_id: null,
-        metadata: customer.metadata,
-        delinquent: customer.delinquent,
-        created_at: new Date(),
-      })
-      .select()
-      .single();
-
-    console.log('storedPayment: ', JSON.stringify(storedPayment, null, 2));
 
     res.json({
       customerId: customer.id,
