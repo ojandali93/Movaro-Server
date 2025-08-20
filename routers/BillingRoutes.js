@@ -284,31 +284,35 @@ router.post("/payment-sheet", async (req, res) => {
 
     // (Optional) Pre-insert a pending row for UI purposes
     if (tier && paymentAmount != null) {
-      const { error } = await supabase.from("Subscriptions").insert({
-        business_id: businessId,
-        user_id: userId,
-        stripe_customer_id: customer.id,
-        stripe_subscription_id: null,
-        tier,
-        billing_mode: "monthly",
-        payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0,
-        currency: "usd",
-        total_drivers: Number(totalDrivers || 0),
-        drivers_left: Number(driversLeft || totalDrivers || 0),
-        total_stops: Number(totalStops || 0),
-        stops_left: Number(stopsLeft || totalStops || 0),
-        status: "pending_payment_method",
-        last_payment_at: null,
-        current_period_start: new Date(),
-        current_period_end: null,
-        cancel_at_period_end: false,
-        canceled_at: null,
-        default_payment_method_id: null,
-        latest_invoice_id: null,
-        metadata: customer.metadata || {},
-        created_at: new Date(),
-        updated_at: new Date(),
-      });
+      const { error } = await supabase
+        .from("Subscriptions")
+        .insert({
+          business_id: businessId,
+          user_id: userId,
+          stripe_customer_id: customer.id,
+          stripe_subscription_id: null,
+          tier,
+          billing_mode: "monthly",
+          payment_amount_cents: Math.round(Number(paymentAmount) * 100) || 0,
+          currency: "usd",
+          total_drivers: Number(totalDrivers || 0),
+          drivers_left: Number(driversLeft || totalDrivers || 0),
+          total_stops: Number(totalStops || 0),
+          stops_left: Number(stopsLeft || totalStops || 0),
+          status: "pending_payment_method",
+          last_payment_at: null,
+          current_period_start: new Date(),
+          current_period_end: null,
+          cancel_at_period_end: false,
+          canceled_at: null,
+          default_payment_method_id: null,
+          latest_invoice_id: null,
+          metadata: customer.metadata || {},
+          created_at: new Date(),
+          updated_at: new Date(),
+        })
+        .select("id")
+        .single();
       // ignore unique conflicts if you call twice
       if (error && error.code !== "23505") {
         console.warn("Subscriptions pre-insert warning:", error);
