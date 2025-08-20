@@ -54,6 +54,9 @@ router.post("/payment-sheet", async (req, res) => {
       customer: customer.id,
     });
 
+    let currentPeriodEnd = new Date();
+    currentPeriodEnd.setMonth(currentPeriodEnd.getMonth() + 1);
+
     const storedPayment = await supabase
       .from('Subscriptions')
       .insert({
@@ -72,7 +75,7 @@ router.post("/payment-sheet", async (req, res) => {
         status: 'active',
         last_payment_at: new Date(),
         current_period_start: new Date(),
-        current_period_end: new Date(),
+        current_period_end: currentPeriodEnd,
         cancel_at_period_end: false,
         canceled_at: null,
         default_payment_method_id: null,
