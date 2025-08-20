@@ -734,8 +734,6 @@ router.post("/customers", async (req, res) => {
           const toUpdate = {};
           if (name && customer.name !== name) toUpdate.name = name;
           if (phone && customer.phone !== phone) toUpdate.phone = phone;
-          if (address) toUpdate.address = address;
-          if (address) toUpdate.shipping = address;
           if (metadata && typeof metadata === "object") {
             toUpdate.metadata = { ...(customer.metadata || {}), ...metadata };
           }
@@ -754,8 +752,6 @@ router.post("/customers", async (req, res) => {
         name,
         email,
         ...(phone ? { phone } : {}),
-        ...(address ? { address } : {}),
-        ...(address ? { shipping: address } : {}),
         metadata: {
           ...(typeof metadata === "object" ? metadata : {}),
           ...(businessId ? { businessId: String(businessId) } : {}),
