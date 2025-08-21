@@ -38,7 +38,6 @@ app.use(express.urlencoded({ extended: true, limit: '20mb' }));
 app.use('/notifications', NotificationRoutes);
 app.get('/health', (req, res) => res.send('✅ Marhaba backend is running'));
 app.use('/billing', billingRouter);
-app.post('/billing/webhook', bodyParser.raw({ type: 'application/json' }), billingWebhook);
 
 // --- SERVER START ---
 server.listen(PORT, () => {
