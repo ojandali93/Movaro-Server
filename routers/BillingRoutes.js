@@ -382,19 +382,56 @@ async function getBusinessByStripeCustomerId(stripeCustomerId: string) {
 // ================================ ROUTES ================================
 
 /** Check customer state: exists + has default payment method */
-router.post("/customer-state", async (req: Request, res: Response) => {
+router.post('/customer-state', async (req, res) => {
   try {
     const { businessId } = req.body || {};
-    if (!businessId) return res.status(400).json({ error: "Missing businessId" });
-    const biz = await loadBusinessRow(businessId);
-    if (!biz.stripe_customer_id) return res.status(409).json({ error: "missing_customer" });
+    if (!businessId) {
+      return res.status(400).json({ error: 'Missing businessId' });
+    }
 
-    const customer = (await stripe.customers.retrieve(biz.stripe_customer_id)) as Stripe.Customer;
-    const hasDefault = !!customer?.invoice_settings?.default_payment_method;
-    res.json({ customerId: biz.stripe_customer_id, hasDefaultPaymentMethod: hasDefault });
+    // read Business.stripe_customer_id
+    const { data: biz, error: bizErr } = await supabase
+      .from('Business')
+      .select('stripe_customer_id')
+      .eq('id', businessId)
+      .single();
+
+    if (bizErr) {
+      return res.status(400).json({ error: 'Business lookup failed' });
+    }
+
+    const customerId = biz?.stripe_customer_id || null;
+    if (!customerId) {
+      return res.json({
+        hasStripeCustomer: false,
+        hasDefaultPaymentMethod: false,
+        customerId: null,
+      });
+    }
+
+    // check for default payment method
+    const cust = await stripe.customers.retrieve(customerId);
+    // @ts-ignore
+    const defaultPM = cust?.invoice_settings?.default_payment_method || null;
+
+    // If no explicit default, see if any card exists
+    let hasAnyCard = false;
+    if (!defaultPM) {
+      const pms = await stripe.paymentMethods.list({
+        customer: customerId,
+        type: 'card',
+      });
+      hasAnyCard = (pms.data || []).length > 0;
+    }
+
+    return res.json({
+      hasStripeCustomer: true,
+      hasDefaultPaymentMethod: !!defaultPM || hasAnyCard,
+      customerId,
+    });
   } catch (e) {
-    console.error("customer-state error:", e);
-    res.status(500).json({ error: "customer-state failed", detail: stringify(e) });
+    console.error('customer-state error:', e);
+    return res.status(500).json({ error: 'customer-state failed' });
   }
 });
 
