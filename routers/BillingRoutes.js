@@ -115,41 +115,27 @@ router.post("/customers", async (req, res) => {
 /** COMBINED: ensure customer, check card, return PaymentSheet bits if needed */
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const { businessId, email, name } = req.body || {};
+    const { businessId, email, customerId } = req.body || {};
     if (!businessId || !email) return jerr(res, 400, "Missing businessId/email");
 
-    const biz = await loadBusinessRow(businessId);
-
-    // Ensure Stripe customer exists (reuse by email, or create)
-    let customerId = biz.stripe_customer_id || null;
-    if (!customerId) {
-      const found = await stripe.customers.list({ email, limit: 1 });
-      let customer = found.data[0];
-      if (customer) {
-        if (name && customer.name !== name) {
-          customer = await stripe.customers.update(customer.id, { name });
-        }
-      } else {
-        customer = await stripe.customers.create({
-          email, name, metadata: { businessId: String(businessId) },
-        });
-      }
-      customerId = customer.id;
-      // Save mapping to Business
-      await supabase.from("Business").update({
-        stripe_customer_id: customerId, updated_at: new Date(),
-      }).eq("id", businessId);
-    }
+    console.log("businessId", businessId);
+    console.log("email", email);
+    console.log("customerId", customerId);
+    console.log("req.body", req.body);
 
     // Check for card
     const cust = await stripe.customers.retrieve(customerId);
+    console.log("cust", cust);
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
+    console.log("defaultPM", defaultPM);
     let hasDefaultPaymentMethod = !!defaultPM;
     if (!hasDefaultPaymentMethod) {
       const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
+      console.log("pms", pms);
       hasDefaultPaymentMethod = pms.data.length > 0;
     }
 
+    console.log("hasDefaultPaymentMethod", hasDefaultPaymentMethod);
     if (hasDefaultPaymentMethod) {
       return ok(res, {
         hasStripeCustomer: true,
@@ -166,11 +152,12 @@ router.post("/payment-sheet", async (req, res) => {
       { customer: customerId },
       { apiVersion: MOBILE_API_VERSION }
     );
+    console.log("ephemeralKey", ephemeralKey);
     const setupIntent = await stripe.setupIntents.create({
       customer: customerId,
       usage: "off_session",
     });
-
+    console.log("setupIntent", setupIntent);
     return ok(res, {
       hasStripeCustomer: true,
       hasDefaultPaymentMethod: false,
