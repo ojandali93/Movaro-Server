@@ -29,6 +29,89 @@ async function loadBusinessRow(businessId) {
   return data;
 }
 
+// --- create/reuse Stripe customer at signup ---
+router.post("/customers", async (req, res) => {
+  try {
+    const { name, email, businessId, phone, metadata, forceNew = false } = req.body || {};
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing email" });
+    }
+
+    let customer = null;
+
+    // Try re-use by email unless forceNew is true
+    if (!forceNew) {
+      try {
+        const found = await stripe.customers.list({ email, limit: 1 });
+        if (found.data[0]) customer = found.data[0];
+      } catch (e) {
+        // non-fatal
+        console.warn("Stripe customers.list warning:", e?.message || e);
+      }
+    }
+
+    // Create if not found
+    if (!customer) {
+      customer = await stripe.customers.create({
+        email,
+        name,
+        ...(phone ? { phone } : {}),
+        metadata: {
+          ...(metadata || {}),
+          ...(businessId ? { businessId: String(businessId) } : {}),
+        },
+      });
+    } else if (name || phone || metadata) {
+      // Light “freshen” of fields if changed
+      const toUpdate = {};
+      if (name && customer.name !== name) toUpdate.name = name;
+      if (phone && customer.phone !== phone) toUpdate.phone = phone;
+      if (metadata && typeof metadata === "object") {
+        toUpdate.metadata = { ...(customer.metadata || {}), ...metadata };
+      }
+      if (Object.keys(toUpdate).length > 0) {
+        customer = await stripe.customers.update(customer.id, toUpdate);
+      }
+    }
+
+    // Optionally map to Business.stripe_customer_id
+    let savedToBusiness = false;
+    if (businessId) {
+      try {
+        const { error } = await supabase
+          .from("Business")
+          .update({ stripe_customer_id: customer.id, updated_at: new Date() })
+          .eq("id", businessId);
+        if (!error) savedToBusiness = true;
+      } catch (e) {
+        console.warn("Business update warning:", e?.message || e);
+      }
+    }
+
+    // Clean payload
+    const clean = (c) => ({
+      id: c.id,
+      name: c.name || null,
+      email: c.email || null,
+      phone: c.phone || null,
+      address: c.address || null,
+      metadata: c.metadata || {},
+      created: c.created ? new Date(c.created * 1000) : null,
+    });
+
+    return res.json({
+      ok: true,
+      customerId: customer.id,
+      customer: clean(customer),
+      savedToBusiness,
+    });
+  } catch (err) {
+    console.error("customers error:", err);
+    return res.status(500).json({ ok: false, error: "customers failed", detail: String(err?.message || err) });
+  }
+});
+
+
 /** COMBINED: ensure customer, check card, return PaymentSheet bits if needed */
 router.post("/payment-sheet", async (req, res) => {
   try {
