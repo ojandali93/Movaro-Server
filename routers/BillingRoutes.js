@@ -334,6 +334,7 @@ router.post("/payment-sheet", async (req, res) => {
 
       // try reuse by email
       const found = await stripe.customers.list({ email, limit: 1 });
+      console.log("found", found);
       if (found.data[0]) {
         customer = found.data[0];
         // optional: update name
@@ -352,6 +353,7 @@ router.post("/payment-sheet", async (req, res) => {
       }
 
       customerId = customer.id;
+      console.log("customerId", customerId);
 
       // persist mapping to Business (idempotent)
       try {
@@ -365,11 +367,13 @@ router.post("/payment-sheet", async (req, res) => {
     }
 
     if (!customerId) {
+      console.log('no cu sotmer idkd')
       return res.status(409).json({ ok: false, error: "missing_customer" });
     }
 
     // 3) Determine if a default payment method exists
     const cust = await stripe.customers.retrieve(customerId);
+    console.log("cust", cust);
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
 
     let hasDefaultPaymentMethod = !!defaultPM;
@@ -377,7 +381,7 @@ router.post("/payment-sheet", async (req, res) => {
       const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
       hasDefaultPaymentMethod = pms.data.length > 0;
     }
-
+    console.log("hasDefaultPaymentMethod", hasDefaultPaymentMethod);
     // 4) If card on file → no need for PaymentSheet
     if (hasDefaultPaymentMethod) {
       return res.json({
@@ -397,11 +401,12 @@ router.post("/payment-sheet", async (req, res) => {
       { customer: customerId },
       { apiVersion: MOBILE_API_VERSION }
     );
+    console.log("ephemeralKey", ephemeralKey);
     const setupIntent = await stripe.setupIntents.create({
       customer: customerId,
       usage: "off_session",
     });
-
+    console.log("setupIntent", setupIntent);
     return res.json({
       ok: true,
       hasStripeCustomer: true,
