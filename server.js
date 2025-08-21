@@ -9,7 +9,7 @@ import compression from 'compression';
 import http from 'http';
 
 import NotificationRoutes from './routers/NotificationRoutes.js';
-import billingRouter, { billingWebhook } from './routers/BillingRoutes.js';
+import billingRouter from './routers/BillingRoutes.js';
 dotenv.config();
 
 const app = express();
