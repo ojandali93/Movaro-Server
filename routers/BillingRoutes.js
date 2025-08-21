@@ -394,6 +394,7 @@ router.post("/subscribe", async (req, res) => {
         items,
         payment_settings: { save_default_payment_method: "on_subscription" },
         payment_behavior: "default_incomplete",
+        collection_method: 'charge_automatically',
         proration_behavior: "create_prorations",
         metadata: {
           businessId: String(businessId),
@@ -498,7 +499,7 @@ router.post("/subscribe", async (req, res) => {
         : null;
 
     if (inv && localSubId) {
-      const pi = inv.payment_intent;
+      const pi  = inv?.payment_intent && typeof inv.payment_intent === 'object' ? inv.payment_intent : null;
       const piObj = typeof pi === "object" ? pi : null;
       const charge = piObj?.charges?.data?.[0] || null;
 
@@ -551,19 +552,88 @@ router.post("/subscribe", async (req, res) => {
         raw: inv,
         created_at: new Date(),
       });
-
-      paymentIntentSecret = piObj?.client_secret || null;
     }
 
     return res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      paymentIntentClientSecret: paymentIntentSecret || null,
+      paymentIntentClientSecret: piObj?.client_secret || null,
     });
   } catch (e) {
     console.error("subscribe error", e);
     return res.status(500).json({ error: "subscribe failed", detail: String(e?.message || e) });
   }
 });
+
+app.post('/stripe/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    let event;
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,
+        req.headers['stripe-signature'],
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (err) {
+      return res.status(400).send(`Webhook Error: ${(err as any).message}`);
+    }
+
+    switch (event.type) {
+      case 'invoice.payment_succeeded': {
+        const inv = event.data.object as Stripe.Invoice;
+        const subId = typeof inv.subscription === 'string'
+          ? inv.subscription
+          : inv.subscription?.id;
+
+        // Flip to active; update period dates + last_payment_at
+        await supabase.from('Subscriptions')
+          .update({
+            status: 'active',
+            last_payment_at: new Date(),
+            current_period_start: inv.lines?.data?.[0]?.period?.start
+              ? new Date(inv.lines.data[0].period.start * 1000) : null,
+            current_period_end: inv.lines?.data?.[0]?.period?.end
+              ? new Date(inv.lines.data[0].period.end * 1000) : null,
+          })
+          .eq('stripe_subscription_id', subId);
+        break;
+      }
+      case 'invoice.payment_failed': {
+        const inv = event.data.object as Stripe.Invoice;
+        const subId = typeof inv.subscription === 'string'
+          ? inv.subscription
+          : inv.subscription?.id;
+        await supabase.from('Subscriptions')
+          .update({ status: 'past_due' })
+          .eq('stripe_subscription_id', subId);
+        break;
+      }
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object as Stripe.Subscription;
+        await supabase.from('Subscriptions')
+          .update({
+            status: sub.status,
+            cancel_at_period_end: !!sub.cancel_at_period_end,
+            canceled_at: sub.canceled_at ? new Date(sub.canceled_at * 1000) : null,
+            current_period_start: sub.current_period_start
+              ? new Date(sub.current_period_start * 1000) : null,
+            current_period_end: sub.current_period_end
+              ? new Date(sub.current_period_end * 1000) : null,
+          })
+          .eq('stripe_subscription_id', sub.id);
+        break;
+      }
+    }
+    res.json({ received: true });
+  }
+);
+
+router.get('/billing/subscriptions/:id', async (req, res) => {
+  const sub = await stripe.subscriptions.retrieve(req.params.id);
+  res.json({ status: sub.status });
+});
+
 
 export default router;
