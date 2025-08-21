@@ -454,14 +454,14 @@ router.post("/subscribe", async (req, res) => {
     const { data: existing } = await supabase
       .from("Subscriptions")
       .select("id")
-      .eq("stripe_subscription_id", subscription.id)
+      .eq("stripe_customer_id", biz.stripe_customer_id)
       .single();
 
     let localSubId = null;
     if (existing?.id) {
       await supabase.from("Subscriptions")
         .update(subPayload)
-        .eq("stripe_subscription_id", subscription.id);
+        .eq("stripe_customer_id", biz.stripe_customer_id);
       localSubId = existing.id;
     } else {
       const ins = await supabase
