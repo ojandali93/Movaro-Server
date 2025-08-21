@@ -2,10 +2,17 @@
 import express from "express";
 import Stripe from "stripe";
 import { supabase } from "../utils/supabase.js";
+import crypto from "crypto";
+
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: "2024-06-20" });
 const MOBILE_API_VERSION = "2024-06-20";
+
+function safeIdemKey(parts) {
+  const joined = parts.map(p => (p == null ? "" : String(p))).join(":");
+  return joined.replace(/[^\w.\-:]/g, "_").slice(0, 200);
+}
 
 // Map your base plan tiers to Stripe Price IDs (change to yours)
 const TIER_PRICE_REF = {
@@ -295,60 +302,267 @@ router.post("/payment-sheet", async (req, res) => {
 /** SIMPLE SUBSCRIBE: base plan only (no add-ons yet) */
 router.post("/subscribe", async (req, res) => {
   try {
-    const { businessId, plan } = req.body || {};
-    if (!businessId || !plan?.tierId) return jerr(res, 400, "Missing businessId/plan");
-
-    const biz = await loadBusinessRow(businessId);
-    if (!biz.stripe_customer_id) return jerr(res, 409, "missing_customer");
-
-    // Make sure a card exists
-    const cust = await stripe.customers.retrieve(biz.stripe_customer_id);
-    const hasPM = !!cust?.invoice_settings?.default_payment_method
-      || (await stripe.paymentMethods.list({ customer: biz.stripe_customer_id, type: "card" })).data.length > 0;
-
-    if (!hasPM) {
-      return ok(res, { requiresPaymentMethod: true, message: "Collect a card first with PaymentSheet." });
+    const { businessId, userId, plan } = req.body || {};
+    if (!businessId || !plan?.tierId) {
+      return res.status(400).json({ error: "Missing businessId/plan" });
     }
 
-    // Use a mapped price, or ad-hoc cents if provided
-    let items = [];
+    // 1) Load business & ensure Stripe customer
+    const biz = await loadBusinessRow(businessId);
+    if (!biz.stripe_customer_id) {
+      return res.status(409).json({ error: "missing_customer" });
+    }
+
+    // 2) Ensure we have a default PM
+    const cust = await stripe.customers.retrieve(biz.stripe_customer_id);
+    let defaultPM = cust?.invoice_settings?.default_payment_method || null;
+    if (!defaultPM) {
+      const pms = await stripe.paymentMethods.list({
+        customer: biz.stripe_customer_id,
+        type: "card",
+      });
+      if (pms.data[0]) {
+        await stripe.customers.update(biz.stripe_customer_id, {
+          invoice_settings: { default_payment_method: pms.data[0].id },
+        });
+        defaultPM = pms.data[0].id;
+      }
+    }
+    if (!defaultPM) {
+      return res.status(200).json({
+        requiresPaymentMethod: true,
+        message: "Collect a card first with PaymentSheet.",
+      });
+    }
+
+    // 3) Build subscription items (base + add-ons)
+    const items = [];
+
+    // Base: use mapped price or ad-hoc cents
     if (Number.isFinite(plan.baseAmountCents)) {
-      const price = await stripe.prices.create({
+      const basePrice = await stripe.prices.create({
         unit_amount: Math.round(Number(plan.baseAmountCents)),
         currency: "usd",
         recurring: { interval: "month" },
         product_data: { name: `Movaro ${plan.tierId} (base)` },
       });
-      items.push({ price: price.id, quantity: 1 });
+      items.push({ price: basePrice.id, quantity: 1 });
     } else {
       const mapped = TIER_PRICE_REF[plan.tierId]?.priceId;
-      if (!mapped) return jerr(res, 400, `Unknown tierId: ${plan.tierId}`);
+      if (!mapped) return res.status(400).json({ error: `Unknown tierId: ${plan.tierId}` });
       items.push({ price: mapped, quantity: 1 });
     }
 
-    const subscription = await stripe.subscriptions.create({
-      customer: biz.stripe_customer_id,
-      items,
-      payment_settings: { save_default_payment_method: "on_subscription" },
-      payment_behavior: "default_incomplete",
-      proration_behavior: "create_prorations",
-      metadata: { businessId: String(businessId), tierId: plan.tierId },
-      expand: ["latest_invoice.payment_intent"],
-    });
+    // Add-ons: create one-off prices for simplicity
+    const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
+    const normalizedAddons = [];
+    for (const a of addonsArr) {
+      const kind = String(a?.kind || "").toLowerCase();
+      if (!["driver", "stops100"].includes(kind)) continue;
+      const quantity = Math.max(0, Math.floor(Number(a?.quantity || 0)));
+      if (!quantity) continue;
+      const unitCents = Math.max(0, Math.round(Number(a?.unitCents || 0)));
 
-    const latestInvoice = subscription.latest_invoice;
-    const paymentIntentSecret = typeof latestInvoice === "object"
-      ? latestInvoice?.payment_intent?.client_secret
-      : null;
+      const price = await stripe.prices.create({
+        unit_amount: unitCents,
+        currency: "usd",
+        recurring: { interval: "month" },
+        product_data: {
+          name: kind === "driver" ? "Movaro Driver Add-on" : "Movaro Stops Add-on (per 100)",
+          metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
+        },
+        metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
+      });
 
-    return ok(res, {
+      items.push({ price: price.id, quantity });
+      normalizedAddons.push({ kind, quantity, unitCents, priceId: price.id });
+    }
+
+    const idemKey = safeIdemKey([
+      "sub",
+      businessId,
+      plan.tierId,
+      plan.billingMode || "monthly",
+      Number(plan.baseAmountCents) || 0,
+      ...normalizedAddons.flatMap(a => [a.kind, a.unitCents, a.quantity]),
+    ]);
+
+    // 4) Create subscription (expand enough to cache immediately)
+    const subscription = await stripe.subscriptions.create(
+      {
+        customer: biz.stripe_customer_id,
+        items,
+        payment_settings: { save_default_payment_method: "on_subscription" },
+        payment_behavior: "default_incomplete",
+        proration_behavior: "create_prorations",
+        metadata: {
+          businessId: String(businessId),
+          userId: userId ? String(userId) : "",
+          tierId: plan.tierId,
+          billingMode: plan.billingMode || "monthly",
+          addons_json: JSON.stringify(normalizedAddons),
+        },
+        expand: [
+          "items.data.price",
+          "latest_invoice.payment_intent",
+          "latest_invoice.payment_intent.charges",
+          "latest_invoice.lines",
+        ],
+      },
+      { idempotencyKey: idemKey }
+    );
+
+    // 5) Compute quick totals for Subscriptions cache
+    const driversQty = normalizedAddons.find(a => a.kind === "driver")?.quantity || 0;
+    const stopsHundredsQty = normalizedAddons.find(a => a.kind === "stops100")?.quantity || 0;
+
+    const periodAmountCents = (subscription.items?.data || []).reduce(
+      (sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+      0
+    );
+
+    // 6) Upsert Subscriptions row
+    const subPayload = {
+      business_id: businessId,
+      user_id: userId ?? null,
+      stripe_customer_id: biz.stripe_customer_id,
+      stripe_subscription_id: subscription.id,
+      tier: plan.tierId,
+      billing_mode: plan.billingMode || "monthly",
+      payment_amount_cents: periodAmountCents,
+      currency: "usd",
+      total_drivers: driversQty,
+      drivers_left: driversQty,
+      total_stops: stopsHundredsQty * 100,
+      stops_left: stopsHundredsQty * 100,
+      status: subscription.status,
+      last_payment_at: null,
+      current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null,
+      current_period_end: subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null,
+      cancel_at_period_end: !!subscription.cancel_at_period_end,
+      canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
+      default_payment_method_id: subscription.default_payment_method || null,
+      latest_invoice_id:
+        typeof subscription.latest_invoice === "string"
+          ? subscription.latest_invoice
+          : subscription.latest_invoice?.id || null,
+      metadata: subscription.metadata || {},
+      updated_at: new Date(),
+    };
+
+    // try update-by-stripe_subscription_id, else insert
+    const { data: existing } = await supabase
+      .from("Subscriptions")
+      .select("id")
+      .eq("stripe_subscription_id", subscription.id)
+      .single();
+
+    let localSubId;
+    if (existing?.id) {
+      await supabase.from("Subscriptions")
+        .update(subPayload)
+        .eq("stripe_subscription_id", subscription.id);
+      localSubId = existing.id;
+    } else {
+      const ins = await supabase
+        .from("Subscriptions")
+        .insert({ ...subPayload, created_at: new Date() })
+        .select("id")
+        .single();
+      localSubId = ins.data?.id;
+    }
+
+    // 7) Save SubscriptionItems
+    if (localSubId) {
+      const rows = (subscription.items?.data || []).map(it => ({
+        subscription_id: localSubId,
+        business_id: businessId,
+        type: it.price?.metadata?.kind || "base",
+        stripe_price_id: it.price?.id || null,
+        stripe_item_id: it.id || null,
+        quantity: it.quantity || 1,
+        unit_amount_cents: it.price?.unit_amount ?? null,
+        tier_id: plan.tierId,
+        created_at: new Date(),
+      }));
+      if (rows.length) {
+        await supabase.from("SubscriptionItems").insert(rows);
+      }
+    }
+
+    // 8) Save first invoice to SubscriptionReceipts (if present)
+    let paymentIntentSecret = null;
+    const inv =
+      typeof subscription.latest_invoice === "object"
+        ? subscription.latest_invoice
+        : null;
+
+    if (inv && localSubId) {
+      const pi = inv.payment_intent;
+      const piObj = typeof pi === "object" ? pi : null;
+      const charge = piObj?.charges?.data?.[0] || null;
+
+      // optional: hash fingerprint if present
+      const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
+      const card_fingerprint_hash = fingerprint
+        ? crypto.createHash("sha256").update(fingerprint).digest("hex")
+        : null;
+
+      await supabase.from("SubscriptionReceipts").insert({
+        business_id: businessId,
+        subscription_id: localSubId,
+
+        stripe_invoice_id: inv.id,
+        stripe_payment_intent_id: piObj?.id || (typeof pi === "string" ? pi : null),
+        stripe_charge_id: charge?.id || null,
+
+        billing_reason: inv.billing_reason || null,
+        invoice_status: inv.status || null,
+        payment_intent_status: piObj?.status || null,
+
+        amount_due_cents: inv.amount_due || 0,
+        amount_paid_cents: inv.amount_paid || 0,
+        amount_remaining_cents: inv.amount_remaining || 0,
+        subtotal_cents: inv.subtotal || 0,
+        tax_cents: inv.tax || 0,
+        discount_total_cents: (inv.total_discount_amounts || []).reduce((s, x) => s + (x.amount || 0), 0),
+        currency: inv.currency || "usd",
+
+        period_start: inv.lines?.data?.[0]?.period?.start ? new Date(inv.lines.data[0].period.start * 1000) : null,
+        period_end:   inv.lines?.data?.[0]?.period?.end   ? new Date(inv.lines.data[0].period.end   * 1000) : null,
+
+        hosted_invoice_url: inv.hosted_invoice_url || null,
+        invoice_pdf_url: inv.invoice_pdf || null,
+        receipt_url: charge?.receipt_url || null,
+
+        payment_method_id: (piObj?.payment_method && typeof piObj.payment_method === "string")
+          ? piObj.payment_method
+          : piObj?.payment_method?.id || null,
+        pm_brand: charge?.payment_method_details?.card?.brand || null,
+        pm_last4: charge?.payment_method_details?.card?.last4 || null,
+        pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+        pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
+        card_fingerprint_hash,
+
+        customer_email: inv.customer_email || null,
+        customer_name: inv.customer_name || null,
+
+        line_items: inv.lines || null,
+        raw: inv,
+        created_at: new Date(),
+      });
+
+      paymentIntentSecret = piObj?.client_secret || null;
+    }
+
+    return res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
       paymentIntentClientSecret: paymentIntentSecret || null,
     });
   } catch (e) {
     console.error("subscribe error", e);
-    return jerr(res, 500, "subscribe failed", e);
+    return res.status(500).json({ error: "subscribe failed", detail: String(e?.message || e) });
   }
 });
 
