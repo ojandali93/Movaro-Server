@@ -6,7 +6,7 @@ import { supabase } from "../utils/supabase.js";
 
 const router = express.Router();
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY as string, {
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
   apiVersion: "2024-06-20",
 });
 const MOBILE_API_VERSION = "2024-06-20";
