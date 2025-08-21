@@ -382,86 +382,138 @@ async function getBusinessByStripeCustomerId(stripeCustomerId: string) {
 // ================================ ROUTES ================================
 
 /** Check customer state: exists + has default payment method */
-router.post('/customer-state', async (req, res) => {
+router.post("/payment-sheet", async (req: Request, res: Response) => {
   try {
-    const { businessId } = req.body || {};
-    if (!businessId) {
-      return res.status(400).json({ error: 'Missing businessId' });
+    const { businessId, email, name, createIfMissing = true } = (req.body || {}) as {
+      businessId?: string | number;
+      email?: string;
+      name?: string;
+      createIfMissing?: boolean;
+    };
+
+    if (!businessId || !email) {
+      return res.status(400).json({ error: "Missing businessId/email" });
     }
 
-    // read Business.stripe_customer_id
+    // 1) Load business
     const { data: biz, error: bizErr } = await supabase
-      .from('Business')
-      .select('stripe_customer_id')
-      .eq('id', businessId)
+      .from("Business")
+      .select("id, stripe_customer_id")
+      .eq("id", businessId)
       .single();
 
-    if (bizErr) {
-      return res.status(400).json({ error: 'Business lookup failed' });
+    if (bizErr || !biz) {
+      return res.status(404).json({ error: "Business not found" });
     }
 
-    const customerId = biz?.stripe_customer_id || null;
+    // 2) Ensure Stripe customer exists (re-use by email, or create)
+    let customerId = biz.stripe_customer_id as string | null;
+    let createdNew = false;
+
+    if (!customerId && createIfMissing) {
+      let customer: Stripe.Customer | null = null;
+
+      // try reuse by email
+      const found = await stripe.customers.list({ email, limit: 1 });
+      if (found.data[0]) {
+        customer = found.data[0];
+        // optional: freshen name/metadata
+        const toUpdate: Stripe.CustomerUpdateParams = {};
+        if (name && customer.name !== name) toUpdate.name = name;
+        if (Object.keys(toUpdate).length > 0) {
+          customer = await stripe.customers.update(customer.id, toUpdate);
+        }
+      } else {
+        // create
+        const idemKey = safeIdemKey(["cust", businessId, email]);
+        customer = await stripe.customers.create(
+          {
+            email,
+            name,
+            metadata: { businessId: String(businessId) },
+          },
+          { idempotencyKey: idemKey }
+        );
+        createdNew = true;
+      }
+
+      customerId = customer.id;
+
+      // persist mapping to Business (idempotent)
+      try {
+        await supabase
+          .from("Business")
+          .update({ stripe_customer_id: customerId, updated_at: new Date() })
+          .eq("id", businessId);
+      } catch (e) {
+        console.warn("Business mapping update warning:", stringify(e));
+      }
+    }
+
+    // If still no customer (e.g., createIfMissing=false)
     if (!customerId) {
-      return res.json({
-        hasStripeCustomer: false,
-        hasDefaultPaymentMethod: false,
-        customerId: null,
-      });
+      return res.status(409).json({ error: "missing_customer" });
     }
 
-    // check for default payment method
-    const cust = await stripe.customers.retrieve(customerId);
+    // 3) Determine if a default payment method exists
+    const cust = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
     // @ts-ignore
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
 
-    // If no explicit default, see if any card exists
-    let hasAnyCard = false;
-    if (!defaultPM) {
+    let hasDefaultPaymentMethod = !!defaultPM;
+    if (!hasDefaultPaymentMethod) {
       const pms = await stripe.paymentMethods.list({
         customer: customerId,
-        type: 'card',
+        type: "card",
       });
-      hasAnyCard = (pms.data || []).length > 0;
+      hasDefaultPaymentMethod = pms.data.length > 0;
+      // (Optional) set first card as default here if you want:
+      // if (!defaultPM && pms.data[0]) {
+      //   await stripe.customers.update(customerId, {
+      //     invoice_settings: { default_payment_method: pms.data[0].id },
+      //   });
+      //   hasDefaultPaymentMethod = true;
+      // }
     }
 
-    return res.json({
-      hasStripeCustomer: true,
-      hasDefaultPaymentMethod: !!defaultPM || hasAnyCard,
-      customerId,
-    });
-  } catch (e) {
-    console.error('customer-state error:', e);
-    return res.status(500).json({ error: 'customer-state failed' });
-  }
-});
+    // 4) If card on file → no need for PaymentSheet
+    if (hasDefaultPaymentMethod) {
+      return res.json({
+        ok: true,
+        hasStripeCustomer: true,
+        hasDefaultPaymentMethod: true,
+        customerId,
+        ephemeralKey: null,
+        setupIntentClientSecret: null,
+        merchantCountryCode: "US",
+        createdNew,
+      });
+    }
 
-/** PaymentSheet setup (no DB writes) */
-router.post("/payment-sheet", async (req: Request, res: Response) => {
-  try {
-    const { businessId, email } = req.body || {};
-    if (!businessId || !email) return res.status(400).json({ error: "Missing businessId/email" });
-
-    const biz = await loadBusinessRow(businessId);
-    if (!biz.stripe_customer_id) return res.status(409).json({ error: "missing_customer" });
-
+    // 5) Else, prepare PaymentSheet (Ephemeral Key + SetupIntent)
     const ephemeralKey = await stripe.ephemeralKeys.create(
-      { customer: biz.stripe_customer_id },
+      { customer: customerId },
       { apiVersion: MOBILE_API_VERSION }
     );
     const setupIntent = await stripe.setupIntents.create({
-      customer: biz.stripe_customer_id,
+      customer: customerId,
       usage: "off_session",
     });
 
-    res.json({
-      customerId: biz.stripe_customer_id,
+    return res.json({
+      ok: true,
+      hasStripeCustomer: true,
+      hasDefaultPaymentMethod: false,
+      customerId,
       ephemeralKey: ephemeralKey.secret,
       setupIntentClientSecret: setupIntent.client_secret,
       merchantCountryCode: "US",
+      createdNew,
     });
   } catch (err) {
     console.error("payment-sheet error:", err);
-    res.status(400).json({ error: stringify(err) });
+    // Always return JSON (prevents the client’s “Unexpected character: <”)
+    return res.status(500).json({ ok: false, error: "payment-sheet failed", detail: stringify(err) });
   }
 });
 
