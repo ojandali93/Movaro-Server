@@ -315,7 +315,7 @@ router.post("/subscribe", async (req, res) => {
 
     // 2) Ensure we have a default PM
     const cust = await stripe.customers.retrieve(biz.stripe_customer_id);
-    let defaultPM = (cust as any)?.invoice_settings?.default_payment_method || null;
+    let defaultPM = (cust)?.invoice_settings?.default_payment_method || null;
     if (!defaultPM) {
       const pms = await stripe.paymentMethods.list({
         customer: biz.stripe_customer_id,
@@ -336,7 +336,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 3) Build subscription items (base + add-ons)
-    const items: Array<{ price: string; quantity: number }> = [];
+    const items = [];
 
     // Base: use mapped price or ad-hoc cents
     if (Number.isFinite(plan.baseAmountCents)) {
@@ -355,7 +355,7 @@ router.post("/subscribe", async (req, res) => {
 
     // Add-ons
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
-    const normalizedAddons: Array<{ kind: "driver" | "stops100"; quantity: number; unitCents: number; priceId: string }> = [];
+    const normalizedAddons = [];
     for (const a of addonsArr) {
       const kind = String(a?.kind || "").toLowerCase() as "driver" | "stops100";
       if (!["driver", "stops100"].includes(kind)) continue;
@@ -439,7 +439,7 @@ router.post("/subscribe", async (req, res) => {
     const totalStops   = baseStops + (addonStopsHundreds * 100);
 
     const periodAmountCents = (subscription.items?.data || []).reduce(
-      (sum: number, it: any) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+      (sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
       0
     );
 
@@ -463,7 +463,7 @@ router.post("/subscribe", async (req, res) => {
       current_period_end: subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null,
       cancel_at_period_end: !!subscription.cancel_at_period_end,
       canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
-      default_payment_method_id: (subscription as any).default_payment_method || null,
+      default_payment_method_id: (subscription).default_payment_method || null,
       latest_invoice_id:
         typeof subscription.latest_invoice === "string"
           ? subscription.latest_invoice
@@ -479,7 +479,7 @@ router.post("/subscribe", async (req, res) => {
       .eq("stripe_subscription_id", subscription.id)
       .single();
 
-    let localSubId: number | null = null;
+    let localSubId = null;
     if (existing?.id) {
       await supabase.from("Subscriptions")
         .update(subPayload)
@@ -495,15 +495,15 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 7) Extract PI client_secret (so the app can confirm) + save receipt ------
-    let paymentIntentClientSecret: string | null = null;
+    let paymentIntentClientSecre = null;
 
     const inv = typeof subscription.latest_invoice === "object"
-      ? (subscription.latest_invoice as Stripe.Invoice)
+      ? (subscription.latest_invoice)
       : null;
 
     if (inv) {
       const pi = inv.payment_intent && typeof inv.payment_intent === "object"
-        ? (inv.payment_intent as Stripe.PaymentIntent)
+        ? (inv.payment_intent)
         : null;
 
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
@@ -539,7 +539,7 @@ router.post("/subscribe", async (req, res) => {
           payment_method_id:
             (pi?.payment_method && typeof pi.payment_method === "string")
               ? pi.payment_method
-              : (pi?.payment_method as any)?.id || null,
+              : (pi?.payment_method)?.id || null,
           pm_brand: charge?.payment_method_details?.card?.brand || null,
           pm_last4: charge?.payment_method_details?.card?.last4 || null,
           pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
