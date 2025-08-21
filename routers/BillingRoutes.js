@@ -336,7 +336,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 3) Build subscription items (base + add-ons)
-    const items = [];
+    const items: Array<{ price: string; quantity: number }> = [];
 
     // Base: use mapped price or ad-hoc cents
     if (Number.isFinite(plan.baseAmountCents)) {
@@ -353,9 +353,9 @@ router.post("/subscribe", async (req, res) => {
       items.push({ price: mapped, quantity: 1 });
     }
 
-    // Add-ons: create one-off prices for simplicity
+    // Add-ons
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
-    const normalizedAddons = [];
+    const normalizedAddons: Array<{ kind: string; quantity: number; unitCents: number; priceId: string }> = [];
     for (const a of addonsArr) {
       const kind = String(a?.kind || "").toLowerCase();
       if (!["driver", "stops100"].includes(kind)) continue;
@@ -387,14 +387,14 @@ router.post("/subscribe", async (req, res) => {
       ...normalizedAddons.flatMap(a => [a.kind, a.unitCents, a.quantity]),
     ]);
 
-    // 4) Create subscription (expand enough to cache immediately)
+    // 4) Create subscription (default_incomplete so we must confirm the PI)
     const subscription = await stripe.subscriptions.create(
       {
         customer: biz.stripe_customer_id,
         items,
         payment_settings: { save_default_payment_method: "on_subscription" },
         payment_behavior: "default_incomplete",
-        collection_method: 'charge_automatically',
+        collection_method: "charge_automatically",
         proration_behavior: "create_prorations",
         metadata: {
           businessId: String(businessId),
@@ -413,12 +413,12 @@ router.post("/subscribe", async (req, res) => {
       { idempotencyKey: idemKey }
     );
 
-    // 5) Compute quick totals for Subscriptions cache
+    // 5) Compute period total
     const driversQty = normalizedAddons.find(a => a.kind === "driver")?.quantity || 0;
     const stopsHundredsQty = normalizedAddons.find(a => a.kind === "stops100")?.quantity || 0;
 
     const periodAmountCents = (subscription.items?.data || []).reduce(
-      (sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+      (sum, it: any) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
       0
     );
 
@@ -451,14 +451,13 @@ router.post("/subscribe", async (req, res) => {
       updated_at: new Date(),
     };
 
-    // try update-by-stripe_subscription_id, else insert
     const { data: existing } = await supabase
       .from("Subscriptions")
       .select("id")
       .eq("stripe_subscription_id", subscription.id)
       .single();
 
-    let localSubId;
+    let localSubId: number | null = null;
     if (existing?.id) {
       await supabase.from("Subscriptions")
         .update(subPayload)
@@ -470,100 +469,89 @@ router.post("/subscribe", async (req, res) => {
         .insert({ ...subPayload, created_at: new Date() })
         .select("id")
         .single();
-      localSubId = ins.data?.id;
+      localSubId = ins.data?.id ?? null;
     }
 
-    // 7) Save SubscriptionItems
-    if (localSubId) {
-      const rows = (subscription.items?.data || []).map(it => ({
-        subscription_id: localSubId,
-        business_id: businessId,
-        type: it.price?.metadata?.kind || "base",
-        stripe_price_id: it.price?.id || null,
-        stripe_item_id: it.id || null,
-        quantity: it.quantity || 1,
-        unit_amount_cents: it.price?.unit_amount ?? null,
-        tier_id: plan.tierId,
-        created_at: new Date(),
-      }));
-      if (rows.length) {
-        await supabase.from("SubscriptionItems").insert(rows);
+    // 7) Extract PI client_secret (so the app can confirm) + save receipt row
+    let paymentIntentClientSecret: string | null = null;
+
+    const inv = typeof subscription.latest_invoice === "object"
+      ? (subscription.latest_invoice as Stripe.Invoice)
+      : null;
+
+    if (inv) {
+      const pi =
+        inv.payment_intent && typeof inv.payment_intent === "object"
+          ? (inv.payment_intent as Stripe.PaymentIntent)
+          : null;
+
+      if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
+
+      if (localSubId) {
+        const charge = pi?.charges?.data?.[0] || null;
+        const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
+        const card_fingerprint_hash = fingerprint
+          ? crypto.createHash("sha256").update(fingerprint).digest("hex")
+          : null;
+
+        await supabase.from("SubscriptionReceipts").insert({
+          business_id: businessId,
+          subscription_id: localSubId,
+          stripe_invoice_id: inv.id,
+          stripe_payment_intent_id: pi?.id || (typeof inv.payment_intent === "string" ? inv.payment_intent : null),
+          stripe_charge_id: charge?.id || null,
+          billing_reason: inv.billing_reason || null,
+          invoice_status: inv.status || null,
+          payment_intent_status: pi?.status || null,
+          amount_due_cents: inv.amount_due || 0,
+          amount_paid_cents: inv.amount_paid || 0,
+          amount_remaining_cents: inv.amount_remaining || 0,
+          subtotal_cents: inv.subtotal || 0,
+          tax_cents: inv.tax || 0,
+          discount_total_cents: (inv.total_discount_amounts || []).reduce((s, x) => s + (x.amount || 0), 0),
+          currency: inv.currency || "usd",
+          period_start: inv.lines?.data?.[0]?.period?.start ? new Date(inv.lines.data[0].period.start * 1000) : null,
+          period_end:   inv.lines?.data?.[0]?.period?.end   ? new Date(inv.lines.data[0].period.end   * 1000) : null,
+          hosted_invoice_url: inv.hosted_invoice_url || null,
+          invoice_pdf_url: inv.invoice_pdf || null,
+          receipt_url: charge?.receipt_url || null,
+          payment_method_id:
+            (pi?.payment_method && typeof pi.payment_method === "string")
+              ? pi.payment_method
+              : (pi?.payment_method as any)?.id || null,
+          pm_brand: charge?.payment_method_details?.card?.brand || null,
+          pm_last4: charge?.payment_method_details?.card?.last4 || null,
+          pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+          pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
+          card_fingerprint_hash,
+          customer_email: inv.customer_email || null,
+          customer_name: inv.customer_name || null,
+          line_items: inv.lines || null,
+          raw: inv,
+          created_at: new Date(),
+        });
       }
     }
 
-    // 8) Save first invoice to SubscriptionReceipts (if present)
-    let paymentIntentSecret = null;
-    const inv =
-      typeof subscription.latest_invoice === "object"
-        ? subscription.latest_invoice
-        : null;
-
-    if (inv && localSubId) {
-      const pi  = inv?.payment_intent && typeof inv.payment_intent === 'object' ? inv.payment_intent : null;
-      const piObj = typeof pi === "object" ? pi : null;
-      const charge = piObj?.charges?.data?.[0] || null;
-
-      // optional: hash fingerprint if present
-      const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
-      const card_fingerprint_hash = fingerprint
-        ? crypto.createHash("sha256").update(fingerprint).digest("hex")
-        : null;
-
-      await supabase.from("SubscriptionReceipts").insert({
-        business_id: businessId,
-        subscription_id: localSubId,
-
-        stripe_invoice_id: inv.id,
-        stripe_payment_intent_id: piObj?.id || (typeof pi === "string" ? pi : null),
-        stripe_charge_id: charge?.id || null,
-
-        billing_reason: inv.billing_reason || null,
-        invoice_status: inv.status || null,
-        payment_intent_status: piObj?.status || null,
-
-        amount_due_cents: inv.amount_due || 0,
-        amount_paid_cents: inv.amount_paid || 0,
-        amount_remaining_cents: inv.amount_remaining || 0,
-        subtotal_cents: inv.subtotal || 0,
-        tax_cents: inv.tax || 0,
-        discount_total_cents: (inv.total_discount_amounts || []).reduce((s, x) => s + (x.amount || 0), 0),
-        currency: inv.currency || "usd",
-
-        period_start: inv.lines?.data?.[0]?.period?.start ? new Date(inv.lines.data[0].period.start * 1000) : null,
-        period_end:   inv.lines?.data?.[0]?.period?.end   ? new Date(inv.lines.data[0].period.end   * 1000) : null,
-
-        hosted_invoice_url: inv.hosted_invoice_url || null,
-        invoice_pdf_url: inv.invoice_pdf || null,
-        receipt_url: charge?.receipt_url || null,
-
-        payment_method_id: (piObj?.payment_method && typeof piObj.payment_method === "string")
-          ? piObj.payment_method
-          : piObj?.payment_method?.id || null,
-        pm_brand: charge?.payment_method_details?.card?.brand || null,
-        pm_last4: charge?.payment_method_details?.card?.last4 || null,
-        pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
-        pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
-        card_fingerprint_hash,
-
-        customer_email: inv.customer_email || null,
-        customer_name: inv.customer_name || null,
-
-        line_items: inv.lines || null,
-        raw: inv,
-        created_at: new Date(),
-      });
+    // 7b) Optional fallback: if there was no PI (very rare), try to pay invoice server-side
+    if (!paymentIntentClientSecret && typeof subscription.latest_invoice === "string") {
+      const paid = await stripe.invoices.pay(subscription.latest_invoice, { expand: ["payment_intent"] });
+      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent as Stripe.PaymentIntent) : null;
+      if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
     }
 
+    // 8) Respond to client (client will call confirmPayment with the secret)
     return res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      paymentIntentClientSecret: piObj?.client_secret || null,
+      paymentIntentClientSecret, // ← this must be non-null for client confirmation (3DS, etc.)
     });
   } catch (e) {
     console.error("subscribe error", e);
     return res.status(500).json({ error: "subscribe failed", detail: String(e?.message || e) });
   }
 });
+
 
 app.post('/stripe/webhook',
   express.raw({ type: 'application/json' }),
