@@ -113,64 +113,184 @@ router.post("/customers", async (req, res) => {
 
 
 /** COMBINED: ensure customer, check card, return PaymentSheet bits if needed */
+// /billing/payment-sheet  (combined: ensure customer + card check + cache snapshot)
 router.post("/payment-sheet", async (req, res) => {
   try {
-    const { businessId, email, customerId } = req.body || {};
-    if (!businessId || !email) return jerr(res, 400, "Missing businessId/email");
+    const {
+      businessId,
+      email,
+      name,
+      customerId: customerIdIn,  // optional
+      userId,                    // optional -> Profile.id
+      tier,                      // optional -> e.g. 'starter'
+      billingMode = "monthly",   // optional; default monthly
+      paymentAmountCents,        // optional; number (cents)
+      paymentAmount,             // optional; number (dollars) if you prefer
+      totalDrivers,              // optional
+      totalStops,                // optional
+      driversLeft,               // optional
+      stopsLeft,                 // optional
+      createIfMissing = true,    // ensure Stripe customer exists
+    } = req.body || {};
 
-    console.log("businessId", businessId);
-    console.log("email", email);
-    console.log("customerId", customerId);
-    console.log("req.body", req.body);
+    if (!businessId || !email) {
+      return res.status(400).json({ ok: false, error: "Missing businessId/email" });
+    }
 
-    // Check for card
+    // ---------- 1) Load business row ----------
+    const { data: biz, error: bizErr } = await supabase
+      .from("Business")
+      .select("id, stripe_customer_id")
+      .eq("id", businessId)
+      .single();
+
+    if (bizErr || !biz) {
+      return res.status(404).json({ ok: false, error: "Business not found" });
+    }
+
+    // ---------- 2) Ensure/retrieve Stripe customer ----------
+    let customerId = customerIdIn || biz.stripe_customer_id || null;
+    let createdNew = false;
+
+    if (!customerId && createIfMissing) {
+      // Try to reuse by email first
+      let customer = null;
+      try {
+        const found = await stripe.customers.list({ email, limit: 1 });
+        if (found.data[0]) {
+          customer = found.data[0];
+          // lightly freshen name
+          if (name && customer.name !== name) {
+            customer = await stripe.customers.update(customer.id, { name });
+          }
+        }
+      } catch (e) {
+        // non-fatal
+        console.warn("Stripe customers.list warn:", e?.message || e);
+      }
+
+      if (!customer) {
+        const idemKey = safeIdemKey(["cust", businessId, email]);
+        customer = await stripe.customers.create(
+          { email, name, metadata: { businessId: String(businessId) } },
+          { idempotencyKey: idemKey }
+        );
+        createdNew = true;
+      }
+
+      customerId = customer.id;
+
+      // Persist mapping to Business (idempotent)
+      try {
+        await supabase
+          .from("Business")
+          .update({ stripe_customer_id: customerId, updated_at: new Date() })
+          .eq("id", businessId);
+      } catch (e) {
+        console.warn("Business mapping update warn:", e?.message || e);
+      }
+    }
+
+    if (!customerId) {
+      return res.status(409).json({ ok: false, error: "missing_customer" });
+    }
+
+    // ---------- 3) Check for default payment method ----------
     const cust = await stripe.customers.retrieve(customerId);
-    console.log("cust", cust);
+    // @ts-ignore (plain JS)
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
-    console.log("defaultPM", defaultPM);
+
     let hasDefaultPaymentMethod = !!defaultPM;
     if (!hasDefaultPaymentMethod) {
       const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
-      console.log("pms", pms);
-      hasDefaultPaymentMethod = pms.data.length > 0;
+      hasDefaultPaymentMethod = (pms.data || []).length > 0;
     }
 
-    console.log("hasDefaultPaymentMethod", hasDefaultPaymentMethod);
-    if (hasDefaultPaymentMethod) {
-      return ok(res, {
-        hasStripeCustomer: true,
-        hasDefaultPaymentMethod: true,
-        customerId,
-        ephemeralKey: null,
-        setupIntentClientSecret: null,
-        merchantCountryCode: "US",
+    // ---------- 4) Prepare PaymentSheet pieces if needed ----------
+    let epkSecret = null;
+    let siSecret = null;
+    if (!hasDefaultPaymentMethod) {
+      const epk = await stripe.ephemeralKeys.create(
+        { customer: customerId },
+        { apiVersion: MOBILE_API_VERSION }
+      );
+      const si = await stripe.setupIntents.create({
+        customer: customerId,
+        usage: "off_session",
       });
+      epkSecret = epk.secret;
+      siSecret = si.client_secret;
     }
 
-    // Need card → return PaymentSheet pieces
-    const ephemeralKey = await stripe.ephemeralKeys.create(
-      { customer: customerId },
-      { apiVersion: MOBILE_API_VERSION }
-    );
-    console.log("ephemeralKey", ephemeralKey);
-    const setupIntent = await stripe.setupIntents.create({
-      customer: customerId,
-      usage: "off_session",
-    });
-    console.log("setupIntent", setupIntent);
-    return ok(res, {
+    // ---------- 5) Cache a "subscription snapshot" row in Subscriptions ----------
+    // Keep this non-blocking: if it fails we still return success to the client.
+    const amountCents = Number.isFinite(paymentAmountCents)
+      ? Math.round(Number(paymentAmountCents))
+      : Number.isFinite(paymentAmount)
+      ? Math.round(Number(paymentAmount) * 100)
+      : null;
+
+    const asInt = (v) =>
+      v === undefined || v === null || Number.isNaN(Number(v)) ? null : Math.max(0, Math.floor(Number(v)));
+
+    const snapshot = {
+      business_id: businessId,
+      user_id: userId ?? null,
+      stripe_customer_id: customerId,
+      stripe_subscription_id: null, // not created yet
+      tier: tier || null,
+      billing_mode: billingMode || null,
+      payment_amount_cents: amountCents,
+      currency: "usd",
+      total_drivers: asInt(totalDrivers),
+      drivers_left: asInt(driversLeft ?? totalDrivers),
+      total_stops: asInt(totalStops),
+      stops_left: asInt(stopsLeft ?? totalStops),
+      status: hasDefaultPaymentMethod ? "has_pm" : "pending_pm",
+      last_payment_at: null,
+      current_period_start: null,
+      current_period_end: null,
+      cancel_at_period_end: false,
+      canceled_at: null,
+      default_payment_method_id: defaultPM || null,
+      latest_invoice_id: null,
+      metadata: {
+        source: "payment-sheet",
+        createdNewCustomer: !!createdNew,
+      },
+      updated_at: new Date(),
+      // created_at is default now()
+    };
+
+    try {
+      await supabase.from("Subscriptions").insert(snapshot);
+    } catch (dbErr) {
+      // Not fatal—log and continue. You can tighten this later.
+      console.warn("Subscriptions snapshot insert warn:", dbErr?.message || dbErr);
+    }
+
+    // ---------- 6) Respond (always JSON) ----------
+    return res.json({
+      ok: true,
       hasStripeCustomer: true,
-      hasDefaultPaymentMethod: false,
+      hasDefaultPaymentMethod,
       customerId,
-      ephemeralKey: ephemeralKey.secret,
-      setupIntentClientSecret: setupIntent.client_secret,
+      ephemeralKey: epkSecret,                // null if has card
+      setupIntentClientSecret: siSecret,      // null if has card
       merchantCountryCode: "US",
+      createdNew,
     });
-  } catch (e) {
-    console.error("payment-sheet error", e);
-    return jerr(res, 500, "payment-sheet failed", e);
+  } catch (err) {
+    console.error("payment-sheet error:", err);
+    // Always JSON to prevent “Unexpected <” on the client
+    return res.status(500).json({
+      ok: false,
+      error: "payment-sheet failed",
+      detail: String(err?.message || err),
+    });
   }
 });
+
 
 /** SIMPLE SUBSCRIBE: base plan only (no add-ons yet) */
 router.post("/subscribe", async (req, res) => {
