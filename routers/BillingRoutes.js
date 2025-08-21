@@ -85,10 +85,20 @@ router.post("/customers", async (req, res) => {
     let savedToBusiness = false;
     if (businessId) {
       try {
+        const cutoff = new Date("2025-09-10T23:59:59"); // Sept 10, 11:59 PM local time
+        const now = new Date();
+    
+        const updatePayload = {
+          stripe_customer_id: customer.id,
+          updated_at: new Date(),
+          exempt: now < cutoff,
+        };
+    
         const { error } = await supabase
           .from("Business")
-          .update({ stripe_customer_id: customer.id, updated_at: new Date() })
+          .update(updatePayload)
           .eq("id", businessId);
+    
         if (!error) savedToBusiness = true;
       } catch (e) {
         console.warn("Business update warning:", e?.message || e);
