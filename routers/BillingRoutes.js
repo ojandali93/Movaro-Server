@@ -315,7 +315,7 @@ router.post("/subscribe", async (req, res) => {
 
     // 2) Ensure we have a default PM
     const cust = await stripe.customers.retrieve(biz.stripe_customer_id);
-    let defaultPM = cust?.invoice_settings?.default_payment_method || null;
+    let defaultPM = (cust as any)?.invoice_settings?.default_payment_method || null;
     if (!defaultPM) {
       const pms = await stripe.paymentMethods.list({
         customer: biz.stripe_customer_id,
@@ -336,7 +336,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 3) Build subscription items (base + add-ons)
-    const items = [];
+    const items: Array<{ price: string; quantity: number }> = [];
 
     // Base: use mapped price or ad-hoc cents
     if (Number.isFinite(plan.baseAmountCents)) {
@@ -355,9 +355,9 @@ router.post("/subscribe", async (req, res) => {
 
     // Add-ons
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
-    const normalizedAddons = [];
+    const normalizedAddons: Array<{ kind: "driver" | "stops100"; quantity: number; unitCents: number; priceId: string }> = [];
     for (const a of addonsArr) {
-      const kind = String(a?.kind || "").toLowerCase();
+      const kind = String(a?.kind || "").toLowerCase() as "driver" | "stops100";
       if (!["driver", "stops100"].includes(kind)) continue;
       const quantity = Math.max(0, Math.floor(Number(a?.quantity || 0)));
       if (!quantity) continue;
@@ -402,6 +402,9 @@ router.post("/subscribe", async (req, res) => {
           tierId: plan.tierId,
           billingMode: plan.billingMode || "monthly",
           addons_json: JSON.stringify(normalizedAddons),
+          // optional: store the base sent from client for auditing
+          baseDrivers: String(plan.baseDrivers ?? plan.extras?.baseDrivers ?? 0),
+          baseStops:   String(plan.baseStops   ?? plan.extras?.baseStops   ?? 0),
         },
         expand: [
           "items.data.price",
@@ -413,16 +416,34 @@ router.post("/subscribe", async (req, res) => {
       { idempotencyKey: idemKey }
     );
 
-    // 5) Compute period total
-    const driversQty = normalizedAddons.find(a => a.kind === "driver")?.quantity || 0;
-    const stopsHundredsQty = normalizedAddons.find(a => a.kind === "stops100")?.quantity || 0;
+    // 5) Compute allowances (base + add-ons) and period total  -----------------
+    const addonDrivers = normalizedAddons
+      .filter(a => a.kind === "driver")
+      .reduce((sum, a) => sum + (a.quantity || 0), 0);
+
+    const addonStopsHundreds = normalizedAddons
+      .filter(a => a.kind === "stops100")
+      .reduce((sum, a) => sum + (a.quantity || 0), 0);
+
+    // base from client (preferred), fall back to nested extras, else 0
+    const baseDrivers = Math.max(
+      0,
+      Math.floor(Number(plan.baseDrivers ?? plan.extras?.baseDrivers ?? 0))
+    );
+    const baseStops = Math.max(
+      0,
+      Math.floor(Number(plan.baseStops ?? plan.extras?.baseStops ?? 0))
+    );
+
+    const totalDrivers = baseDrivers + addonDrivers;
+    const totalStops   = baseStops + (addonStopsHundreds * 100);
 
     const periodAmountCents = (subscription.items?.data || []).reduce(
-      (sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+      (sum: number, it: any) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
       0
     );
 
-    // 6) Upsert Subscriptions row
+    // 6) Upsert Subscriptions row (by subscription id) -------------------------
     const subPayload = {
       business_id: businessId,
       user_id: userId ?? null,
@@ -432,36 +453,37 @@ router.post("/subscribe", async (req, res) => {
       billing_mode: plan.billingMode || "monthly",
       payment_amount_cents: periodAmountCents,
       currency: "usd",
-      total_drivers: driversQty,
-      drivers_left: driversQty,
-      total_stops: stopsHundredsQty * 100,
-      stops_left: stopsHundredsQty * 100,
+      total_drivers: totalDrivers,
+      drivers_left:  totalDrivers,
+      total_stops:   totalStops,
+      stops_left:    totalStops,
       status: subscription.status,
       last_payment_at: null,
       current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null,
       current_period_end: subscription.current_period_end ? new Date(subscription.current_period_end * 1000) : null,
       cancel_at_period_end: !!subscription.cancel_at_period_end,
       canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
-      default_payment_method_id: subscription.default_payment_method || null,
+      default_payment_method_id: (subscription as any).default_payment_method || null,
       latest_invoice_id:
         typeof subscription.latest_invoice === "string"
           ? subscription.latest_invoice
-          : subscription.latest_invoice?.id || null,
+          : (subscription.latest_invoice as any)?.id || null,
       metadata: subscription.metadata || {},
       updated_at: new Date(),
     };
 
+    // prefer upsert by stripe_subscription_id (not customer)
     const { data: existing } = await supabase
       .from("Subscriptions")
       .select("id")
-      .eq("stripe_customer_id", biz.stripe_customer_id)
+      .eq("stripe_subscription_id", subscription.id)
       .single();
 
-    let localSubId = null;
+    let localSubId: number | null = null;
     if (existing?.id) {
       await supabase.from("Subscriptions")
         .update(subPayload)
-        .eq("stripe_customer_id", biz.stripe_customer_id);
+        .eq("stripe_subscription_id", subscription.id);
       localSubId = existing.id;
     } else {
       const ins = await supabase
@@ -472,18 +494,17 @@ router.post("/subscribe", async (req, res) => {
       localSubId = ins.data?.id ?? null;
     }
 
-    // 7) Extract PI client_secret (so the app can confirm) + save receipt row
-    let paymentIntentClientSecret = null;
+    // 7) Extract PI client_secret (so the app can confirm) + save receipt ------
+    let paymentIntentClientSecret: string | null = null;
 
     const inv = typeof subscription.latest_invoice === "object"
-      ? (subscription.latest_invoice)
+      ? (subscription.latest_invoice as Stripe.Invoice)
       : null;
 
     if (inv) {
-      const pi =
-        inv.payment_intent && typeof inv.payment_intent === "object"
-          ? (inv.payment_intent)
-          : null;
+      const pi = inv.payment_intent && typeof inv.payment_intent === "object"
+        ? (inv.payment_intent as Stripe.PaymentIntent)
+        : null;
 
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
 
@@ -518,7 +539,7 @@ router.post("/subscribe", async (req, res) => {
           payment_method_id:
             (pi?.payment_method && typeof pi.payment_method === "string")
               ? pi.payment_method
-              : (pi?.payment_method)?.id || null,
+              : (pi?.payment_method as any)?.id || null,
           pm_brand: charge?.payment_method_details?.card?.brand || null,
           pm_last4: charge?.payment_method_details?.card?.last4 || null,
           pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
@@ -533,24 +554,25 @@ router.post("/subscribe", async (req, res) => {
       }
     }
 
-    // 7b) Optional fallback: if there was no PI (very rare), try to pay invoice server-side
+    // 7b) Optional: if no PI, try to pay invoice server-side (rare)
     if (!paymentIntentClientSecret && typeof subscription.latest_invoice === "string") {
       const paid = await stripe.invoices.pay(subscription.latest_invoice, { expand: ["payment_intent"] });
-      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent) : null;
+      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent as Stripe.PaymentIntent) : null;
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
     }
 
-    // 8) Respond to client (client will call confirmPayment with the secret)
+    // 8) Respond to client
     return res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      paymentIntentClientSecret, // ← this must be non-null for client confirmation (3DS, etc.)
+      paymentIntentClientSecret,
     });
   } catch (e) {
     console.error("subscribe error", e);
     return res.status(500).json({ error: "subscribe failed", detail: String(e?.message || e) });
   }
 });
+
 
 
 router.post('/stripe/webhook',
