@@ -1,6 +1,5 @@
-// routes/billingRoutes.ts
 /* eslint-disable no-console */
-import express, { Request, Response } from "express";
+import express from "express";
 import Stripe from "stripe";
 import { supabase } from "../utils/supabase.js";
 
@@ -12,98 +11,63 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
 const MOBILE_API_VERSION = "2024-06-20";
 
 // ======================= CANONICAL TIER PRICES =======================
-// Use Stripe *Price IDs* (price_...). If missing, we fallback to product.default_price.
-const TIER_PRICE_REF: Record<
-  string,
-  { priceId?: string; productId?: string }
-> = {
-  starter: { priceId: "price_1Rxd4fFb5QGtuTxnswOezQOy", productId: "prod_StPytgt8pMFCRj" },
-  growth: { priceId: "price_1Rxd71Fb5QGtuTxncCI3eESn", productId: "prod_StPwzSJnzBQ6Zl" },
-  pro: { priceId: "price_1Rxd7aFb5QGtuTxngC037A0a", productId: "prod_StPxGBl2rarQKt" },
-  premium: { priceId: "price_1Rxd8HFb5QGtuTxn3soBEWl7", productId: "prod_StPyErvu7yRVYN" },
+// Use Stripe *Price IDs* (price_...). If missing, fallback to product.default_price.
+const TIER_PRICE_REF = {
+  starter:    { priceId: "price_1Rxd4fFb5QGtuTxnswOezQOy", productId: "prod_StPytgt8pMFCRj" },
+  growth:     { priceId: "price_1Rxd71Fb5QGtuTxncCI3eESn", productId: "prod_StPwzSJnzBQ6Zl" },
+  pro:        { priceId: "price_1Rxd7aFb5QGtuTxngC037A0a", productId: "prod_StPxGBl2rarQKt" },
+  premium:    { priceId: "price_1Rxd8HFb5QGtuTxn3soBEWl7", productId: "prod_StPyErvu7yRVYN" },
   enterprise: { priceId: "price_1Rxd8wFb5QGtuTxnm0iQqR11", productId: "prod_StPytgt8pMFCRj" },
-  // custom: leave unmapped or handle ad-hoc only
+  // custom: leave unmapped or handle ad-hoc
 };
 
-// Default add-on unit rates (cents) if client does not send unitCents
-const DEFAULT_ADDONS_BY_TIER: Record<
-  string,
-  { driver: number; stops100: number }
-> = {
-  starter: { driver: 0, stops100: 1200 },
-  growth: { driver: 0, stops100: 1000 },
-  pro: { driver: 0, stops100: 900 },
-  premium: { driver: 0, stops100: 900 },
-  enterprise: { driver: 0, stops100: 700 },
-  custom: { driver: 2000, stops100: 700 },
-};
-
-// =============================== TYPES ===============================
-type AddonInput = {
-  kind: "driver" | "stops100";
-  quantity: number; // count (drivers or blocks of +100 stops)
-  unitCents?: number; // cents(price per unit)
-};
-
-type SubscribeBody = {
-  userId?: string | number | null;
-  businessId: string | number;
-  plan: {
-    tierId: string;
-    billingMode: "monthly"; // (extend if you later support annual)
-    baseAmountCents?: number; // optional ad-hoc base price in cents
-    addons?: AddonInput[];
-    notes?: string;
-  };
-};
-
-type CustomerCreateBody = {
-  name: string;
-  email: string;
-  businessId?: string | number;
-  phone?: string;
-  address?: any; // Stripe.AddressParam shape optional
-  metadata?: Record<string, string>;
-  forceNew?: boolean;
+// Default add-on unit rates (cents) if client doesn't send unitCents
+const DEFAULT_ADDONS_BY_TIER = {
+  starter:    { driver: 0,    stops100: 1200 },
+  growth:     { driver: 0,    stops100: 1000 },
+  pro:        { driver: 0,    stops100:  900 },
+  premium:    { driver: 0,    stops100:  900 },
+  enterprise: { driver: 0,    stops100:  700 },
+  custom:     { driver: 2000, stops100:  700 },
 };
 
 // =============================== UTILS ===============================
-const ts = (unix?: number | null) => (unix ? new Date(unix * 1000) : null);
-const stringify = (e: unknown) => {
+const ts = (unix) => (unix ? new Date(unix * 1000) : null);
+const stringify = (e) => {
   if (!e) return "unknown error";
   if (typeof e === "string") return e;
-  // @ts-ignore
-  if (e?.message) return (e as any).message;
+  if (e && typeof e === "object" && "message" in e) return e.message;
   try { return JSON.stringify(e); } catch { return String(e); }
 };
 
 // Stripe Idempotency-Key must be ASCII & short. This makes a safe key.
-function safeIdemKey(parts: Array<string | number | boolean | null | undefined>) {
+function safeIdemKey(parts) {
   const joined = parts
     .map((p) => (p === undefined || p === null ? "" : String(p)))
     .join(":");
-  // allow alnum _ . - : only
   const safe = joined.replace(/[^\w.\-:]/g, "_");
   return safe.slice(0, 200);
 }
 
 // =============================== HELPERS ===============================
-async function loadBusinessRow(businessId: string | number) {
+async function loadBusinessRow(businessId) {
   const { data, error } = await supabase
     .from("Business")
     .select("id, stripe_customer_id")
     .eq("id", businessId)
     .single();
   if (error || !data) throw new Error("Business not found");
-  return data as { id: number; stripe_customer_id: string | null };
+  return data; // { id, stripe_customer_id }
 }
 
-async function resolveTierPriceIdRef(tierId: string): Promise<string> {
+async function resolveTierPriceIdRef(tierId) {
   const ref = TIER_PRICE_REF[tierId];
   if (!ref) throw new Error(`Unknown tier '${tierId}'`);
   if (ref.priceId) return ref.priceId;
   if (ref.productId) {
-    const product = await stripe.products.retrieve(ref.productId, { expand: ["default_price"] });
+    const product = await stripe.products.retrieve(ref.productId, {
+      expand: ["default_price"],
+    });
     const dp = product.default_price;
     const priceId = typeof dp === "string" ? dp : dp?.id;
     if (!priceId) throw new Error(`Product ${ref.productId} has no default price`);
@@ -112,11 +76,8 @@ async function resolveTierPriceIdRef(tierId: string): Promise<string> {
   throw new Error(`No price/product mapping for tier '${tierId}'`);
 }
 
-/** If userId not provided, try to infer it from most recent subscription for the business. */
-async function resolveUserIdIfMissing(
-  businessId: string | number,
-  providedUserId?: string | number | null
-): Promise<string | number | null> {
+/** If userId not provided, try to infer from most recent subscription for the business. */
+async function resolveUserIdIfMissing(businessId, providedUserId) {
   if (providedUserId) return providedUserId;
   try {
     const { data } = await supabase
@@ -131,9 +92,8 @@ async function resolveUserIdIfMissing(
 }
 
 /** Ensure a default payment method is set. Returns boolean. */
-async function ensureDefaultPM(customerId: string): Promise<boolean> {
-  const c = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
-  // @ts-ignore
+async function ensureDefaultPM(customerId) {
+  const c = await stripe.customers.retrieve(customerId);
   if (c?.invoice_settings?.default_payment_method) return true;
   const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
   if (pms.data[0]) {
@@ -146,17 +106,7 @@ async function ensureDefaultPM(customerId: string): Promise<boolean> {
 }
 
 /** Create/reuse a monthly Price for an add-on unit amount, cached in StripePriceCache. */
-async function getOrCreateAddonPrice({
-  kind,
-  unit_amount_cents,
-  businessId,
-  tierId,
-}: {
-  kind: "driver" | "stops100";
-  unit_amount_cents: number;
-  businessId: string | number;
-  tierId: string;
-}): Promise<string> {
+async function getOrCreateAddonPrice({ kind, unit_amount_cents, businessId, tierId }) {
   try {
     const { data } = await supabase
       .from("StripePriceCache")
@@ -166,7 +116,7 @@ async function getOrCreateAddonPrice({
       .eq("tier_id", tierId)
       .eq("unit_amount_cents", unit_amount_cents)
       .single();
-    if (data?.stripe_price_id) return data.stripe_price_id as string;
+    if (data?.stripe_price_id) return data.stripe_price_id;
   } catch {}
 
   const price = await stripe.prices.create({
@@ -202,15 +152,7 @@ async function upsertSubscriptionState({
   tier,
   billingMode,
   totals,
-}: {
-  businessId: string | number;
-  userId: string | number | null;
-  stripeCustomerId: string;
-  subscription: Stripe.Subscription;
-  tier: string | null;
-  billingMode: string;
-  totals: { drivers: number; stopsHundreds: number };
-}): Promise<number> {
+}) {
   const totalDrivers = Number(totals?.drivers || 0);
   const totalStops = Number(totals?.stopsHundreds || 0) * 100;
 
@@ -227,7 +169,7 @@ async function upsertSubscriptionState({
     tier,
     billing_mode: billingMode,
     payment_amount_cents: periodAmountCents,
-    currency: (subscription as any).currency || "usd",
+    currency: subscription.currency || "usd",
     total_drivers: totalDrivers,
     drivers_left: totalDrivers,
     total_stops: totalStops,
@@ -238,12 +180,12 @@ async function upsertSubscriptionState({
     current_period_end: ts(subscription.current_period_end),
     cancel_at_period_end: !!subscription.cancel_at_period_end,
     canceled_at: ts(subscription.canceled_at),
-    default_payment_method_id: (subscription as any).default_payment_method || null,
+    default_payment_method_id: subscription.default_payment_method || null,
     latest_invoice_id:
       typeof subscription.latest_invoice === "string"
         ? subscription.latest_invoice
-        : (subscription.latest_invoice as any)?.id || null,
-    metadata: (subscription as any).metadata || {},
+        : subscription.latest_invoice?.id || null,
+    metadata: subscription.metadata || {},
     updated_at: new Date(),
   };
 
@@ -253,7 +195,7 @@ async function upsertSubscriptionState({
     .eq("stripe_subscription_id", subscription.id)
     .single();
 
-  if (findErr && (findErr as any).code !== "PGRST116") throw findErr;
+  if (findErr && findErr.code !== "PGRST116") throw findErr;
 
   if (existing?.id) {
     const { error } = await supabase
@@ -261,7 +203,7 @@ async function upsertSubscriptionState({
       .update(payload)
       .eq("stripe_subscription_id", subscription.id);
     if (error) throw error;
-    return existing.id as number;
+    return existing.id;
   } else {
     const { data, error } = await supabase
       .from("Subscriptions")
@@ -269,28 +211,18 @@ async function upsertSubscriptionState({
       .select("id")
       .single();
     if (error) throw error;
-    return (data as any).id as number;
+    return data.id;
   }
 }
 
-/** (Optional) persist each Stripe subscription item for quick reporting. */
-async function recordSubscriptionItems({
-  businessId,
-  subscriptionIdLocal,
-  subscription,
-  tierId,
-}: {
-  businessId: string | number;
-  subscriptionIdLocal: number;
-  subscription: Stripe.Subscription;
-  tierId: string | null;
-}) {
+/** Persist each Stripe subscription item for quick reporting. */
+async function recordSubscriptionItems({ businessId, subscriptionIdLocal, subscription, tierId }) {
   const items = subscription.items?.data || [];
   if (!items.length) return;
   const rows = items.map((it) => ({
     subscription_id: subscriptionIdLocal,
     business_id: businessId,
-    type: (it.price?.metadata as any)?.kind || "base",
+    type: it.price?.metadata?.kind || "base",
     stripe_price_id: it.price?.id || null,
     stripe_item_id: it.id || null,
     quantity: it.quantity || 1,
@@ -298,26 +230,16 @@ async function recordSubscriptionItems({
     tier_id: tierId,
     created_at: new Date(),
   }));
-  try {
-    await supabase.from("SubscriptionItems").insert(rows);
-  } catch {}
+  try { await supabase.from("SubscriptionItems").insert(rows); } catch {}
 }
 
 /** Insert a receipt row for a Stripe.Invoice into SubscriptionReceipts. */
-async function insertReceiptRow({
-  businessId,
-  subscriptionId,
-  invoice,
-}: {
-  businessId: string | number;
-  subscriptionId: number;
-  invoice: Stripe.Invoice; // expanded (lines, payment_intent, charges)
-}) {
+async function insertReceiptRow({ businessId, subscriptionId, invoice }) {
   if (!invoice) return;
 
-  const piObj = typeof invoice.payment_intent === "object" ? (invoice.payment_intent as Stripe.PaymentIntent) : null;
+  const piObj = typeof invoice.payment_intent === "object" ? invoice.payment_intent : null;
   const paymentIntentId = typeof invoice.payment_intent === "string" ? invoice.payment_intent : piObj?.id || null;
-  const charge = (piObj?.charges?.data || [])[0] || null;
+  const charge = piObj?.charges?.data?.[0] || null;
 
   const { error } = await supabase.from("SubscriptionReceipts").insert({
     business_id: businessId,
@@ -335,28 +257,28 @@ async function insertReceiptRow({
     amount_paid_cents: invoice.amount_paid || 0,
     amount_remaining_cents: invoice.amount_remaining || 0,
     subtotal_cents: invoice.subtotal || 0,
-    tax_cents: (invoice as any).tax || 0,
-    discount_total_cents: (invoice.total_discount_amounts || []).reduce((s, x: any) => s + (x.amount || 0), 0),
+    tax_cents: invoice.tax || 0,
+    discount_total_cents: (invoice.total_discount_amounts || []).reduce((s, x) => s + (x.amount || 0), 0),
     currency: invoice.currency || "usd",
 
-    period_start: ts((invoice as any).period_start || invoice.lines?.data?.[0]?.period?.start),
-    period_end: ts((invoice as any).period_end || invoice.lines?.data?.[0]?.period?.end),
+    period_start: ts(invoice.period_start || invoice.lines?.data?.[0]?.period?.start),
+    period_end: ts(invoice.period_end || invoice.lines?.data?.[0]?.period?.end),
 
     hosted_invoice_url: invoice.hosted_invoice_url || null,
-    invoice_pdf_url: (invoice as any).invoice_pdf || null,
-    receipt_url: (charge as any)?.receipt_url || null,
+    invoice_pdf_url: invoice.invoice_pdf || null,
+    receipt_url: charge?.receipt_url || null,
 
     payment_method_id:
-      typeof (piObj as any)?.payment_method === "string"
-        ? (piObj as any).payment_method
-        : (piObj as any)?.payment_method?.id || null,
-    pm_brand: (charge as any)?.payment_method_details?.card?.brand || null,
-    pm_last4: (charge as any)?.payment_method_details?.card?.last4 || null,
-    pm_exp_month: (charge as any)?.payment_method_details?.card?.exp_month || null,
-    pm_exp_year: (charge as any)?.payment_method_details?.card?.exp_year || null,
+      typeof piObj?.payment_method === "string"
+        ? piObj.payment_method
+        : piObj?.payment_method?.id || null,
+    pm_brand: charge?.payment_method_details?.card?.brand || null,
+    pm_last4: charge?.payment_method_details?.card?.last4 || null,
+    pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+    pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
 
-    customer_email: (invoice as any).customer_email || null,
-    customer_name: (invoice as any).customer_name || null,
+    customer_email: invoice.customer_email || null,
+    customer_name: invoice.customer_name || null,
 
     line_items: invoice.lines || null,
     raw: invoice,
@@ -365,7 +287,7 @@ async function insertReceiptRow({
   if (error) throw error;
 }
 
-async function getBusinessByStripeCustomerId(stripeCustomerId: string) {
+async function getBusinessByStripeCustomerId(stripeCustomerId) {
   try {
     const { data, error } = await supabase
       .from("Business")
@@ -373,7 +295,7 @@ async function getBusinessByStripeCustomerId(stripeCustomerId: string) {
       .eq("stripe_customer_id", stripeCustomerId)
       .single();
     if (error) return null;
-    return data as { id: number } | null;
+    return data;
   } catch {
     return null;
   }
@@ -381,18 +303,18 @@ async function getBusinessByStripeCustomerId(stripeCustomerId: string) {
 
 // ================================ ROUTES ================================
 
-/** Check customer state: exists + has default payment method */
-router.post("/payment-sheet", async (req: Request, res: Response) => {
+/**
+ * Combined PaymentSheet endpoint:
+ * - Ensures/locates Stripe customer for a Business (reuses by email; creates if missing)
+ * - Returns { hasDefaultPaymentMethod: true } if card exists (no PaymentSheet needed)
+ * - Else returns ephemeral key + setup intent for the PaymentSheet
+ */
+router.post("/payment-sheet", async (req, res) => {
   try {
-    const { businessId, email, name, createIfMissing = true } = (req.body || {}) as {
-      businessId?: string | number;
-      email?: string;
-      name?: string;
-      createIfMissing?: boolean;
-    };
+    const { businessId, email, name, createIfMissing = true } = req.body || {};
 
     if (!businessId || !email) {
-      return res.status(400).json({ error: "Missing businessId/email" });
+      return res.status(400).json({ ok: false, error: "Missing businessId/email" });
     }
 
     // 1) Load business
@@ -401,37 +323,29 @@ router.post("/payment-sheet", async (req: Request, res: Response) => {
       .select("id, stripe_customer_id")
       .eq("id", businessId)
       .single();
-
-    if (bizErr || !biz) {
-      return res.status(404).json({ error: "Business not found" });
-    }
+    if (bizErr || !biz) return res.status(404).json({ ok: false, error: "Business not found" });
 
     // 2) Ensure Stripe customer exists (re-use by email, or create)
-    let customerId = biz.stripe_customer_id as string | null;
+    let customerId = biz.stripe_customer_id || null;
     let createdNew = false;
 
     if (!customerId && createIfMissing) {
-      let customer: Stripe.Customer | null = null;
+      let customer = null;
 
       // try reuse by email
       const found = await stripe.customers.list({ email, limit: 1 });
       if (found.data[0]) {
         customer = found.data[0];
-        // optional: freshen name/metadata
-        const toUpdate: Stripe.CustomerUpdateParams = {};
+        // optional: update name
+        const toUpdate = {};
         if (name && customer.name !== name) toUpdate.name = name;
         if (Object.keys(toUpdate).length > 0) {
           customer = await stripe.customers.update(customer.id, toUpdate);
         }
       } else {
-        // create
         const idemKey = safeIdemKey(["cust", businessId, email]);
         customer = await stripe.customers.create(
-          {
-            email,
-            name,
-            metadata: { businessId: String(businessId) },
-          },
+          { email, name, metadata: { businessId: String(businessId) } },
           { idempotencyKey: idemKey }
         );
         createdNew = true;
@@ -450,30 +364,18 @@ router.post("/payment-sheet", async (req: Request, res: Response) => {
       }
     }
 
-    // If still no customer (e.g., createIfMissing=false)
     if (!customerId) {
-      return res.status(409).json({ error: "missing_customer" });
+      return res.status(409).json({ ok: false, error: "missing_customer" });
     }
 
     // 3) Determine if a default payment method exists
-    const cust = (await stripe.customers.retrieve(customerId)) as Stripe.Customer;
-    // @ts-ignore
+    const cust = await stripe.customers.retrieve(customerId);
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
 
     let hasDefaultPaymentMethod = !!defaultPM;
     if (!hasDefaultPaymentMethod) {
-      const pms = await stripe.paymentMethods.list({
-        customer: customerId,
-        type: "card",
-      });
+      const pms = await stripe.paymentMethods.list({ customer: customerId, type: "card" });
       hasDefaultPaymentMethod = pms.data.length > 0;
-      // (Optional) set first card as default here if you want:
-      // if (!defaultPM && pms.data[0]) {
-      //   await stripe.customers.update(customerId, {
-      //     invoice_settings: { default_payment_method: pms.data[0].id },
-      //   });
-      //   hasDefaultPaymentMethod = true;
-      // }
     }
 
     // 4) If card on file → no need for PaymentSheet
@@ -512,25 +414,25 @@ router.post("/payment-sheet", async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error("payment-sheet error:", err);
-    // Always return JSON (prevents the client’s “Unexpected character: <”)
+    // Always JSON to prevent "Unexpected character: <" on the client
     return res.status(500).json({ ok: false, error: "payment-sheet failed", detail: stringify(err) });
   }
 });
 
 /** Create (or reuse) a Stripe customer and map to Business */
-router.post("/customers", async (req: Request<unknown, unknown, CustomerCreateBody>, res: Response) => {
+router.post("/customers", async (req, res) => {
   try {
     const { name, email, businessId, phone, metadata, forceNew } = req.body || {};
     if (!name || !email) return res.status(400).json({ error: "Missing required fields: name, email" });
 
-    let customer: Stripe.Customer | null = null;
+    let customer = null;
 
     if (!forceNew) {
       try {
         const found = await stripe.customers.list({ email, limit: 1 });
         if (found.data[0]) {
           customer = found.data[0];
-          const toUpdate: Stripe.CustomerUpdateParams = {};
+          const toUpdate = {};
           if (name && customer.name !== name) toUpdate.name = name;
           if (phone && customer.phone !== phone) toUpdate.phone = phone;
           if (metadata && typeof metadata === "object") {
@@ -546,7 +448,7 @@ router.post("/customers", async (req: Request<unknown, unknown, CustomerCreateBo
     }
 
     if (!customer) {
-      const createParams: Stripe.CustomerCreateParams = {
+      const createParams = {
         name,
         email,
         ...(phone ? { phone } : {}),
@@ -565,10 +467,7 @@ router.post("/customers", async (req: Request<unknown, unknown, CustomerCreateBo
       try {
         const { error: updErr } = await supabase
           .from("Business")
-          .update({
-            stripe_customer_id: customer.id,
-            updated_at: new Date(),
-          })
+          .update({ stripe_customer_id: customer.id, updated_at: new Date() })
           .eq("id", businessId);
         if (!updErr) savedToBusiness = true;
         else console.warn("Business update warning:", stringify(updErr));
@@ -577,15 +476,15 @@ router.post("/customers", async (req: Request<unknown, unknown, CustomerCreateBo
       }
     }
 
-    const clean = (c: Stripe.Customer) => ({
+    const clean = (c) => ({
       id: c.id,
       name: c.name || null,
       email: c.email || null,
       phone: c.phone || null,
-      address: (c as any).address || null,
-      shipping: (c as any).shipping || null,
-      preferred_locales: (c as any).preferred_locales || null,
-      tax_exempt: (c as any).tax_exempt || "none",
+      address: c.address || null,
+      shipping: c.shipping || null,
+      preferred_locales: c.preferred_locales || null,
+      tax_exempt: c.tax_exempt || "none",
       metadata: c.metadata || {},
       created: c.created ? new Date(c.created * 1000) : null,
     });
@@ -598,10 +497,10 @@ router.post("/customers", async (req: Request<unknown, unknown, CustomerCreateBo
 });
 
 /** Create subscription (base + add-ons), snapshot, and store initial receipt */
-router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, res: Response) => {
+router.post("/subscribe", async (req, res) => {
   try {
-    const { businessId, plan } = req.body || ({} as SubscribeBody);
-    let { userId } = req.body || ({} as SubscribeBody);
+    const { businessId, plan } = req.body || {};
+    let { userId } = req.body || {};
 
     if (!businessId || !plan?.tierId || !plan?.billingMode) {
       return res.status(400).json({ error: "Missing businessId/plan fields" });
@@ -611,9 +510,7 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
     }
 
     const biz = await loadBusinessRow(businessId);
-    if (!biz.stripe_customer_id) {
-      return res.status(409).json({ error: "missing_customer" });
-    }
+    if (!biz.stripe_customer_id) return res.status(409).json({ error: "missing_customer" });
 
     // resolve userId if not provided
     userId = await resolveUserIdIfMissing(businessId, userId);
@@ -627,9 +524,9 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
     }
 
     // ---------- Build subscription items ----------
-    const items: Stripe.SubscriptionCreateParams.Item[] = [];
+    const items = [];
     let pricingMode = "mapped";
-    const addonsArr: AddonInput[] = Array.isArray(plan.addons) ? plan.addons : [];
+    const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
 
     // BASE
     if (Number.isFinite(plan.baseAmountCents)) {
@@ -652,9 +549,9 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
     }
 
     // ADD-ONS
-    const normalizedAddons: Array<{ kind: "driver" | "stops100"; quantity: number; unitCents: number; priceId: string }> = [];
+    const normalizedAddons = [];
     for (const raw of addonsArr) {
-      const kind = String(raw?.kind || "").toLowerCase() as "driver" | "stops100";
+      const kind = String(raw?.kind || "").toLowerCase();
       if (!["driver", "stops100"].includes(kind)) continue;
       const quantity = Math.max(0, Math.floor(Number(raw?.quantity || 0)));
       if (!quantity) continue;
@@ -738,14 +635,14 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
     });
 
     // ---------- Store initial invoice ----------
-    let invoiceObj: Stripe.Invoice | null = null;
+    let invoiceObj = null;
     if (subscription.latest_invoice) {
       invoiceObj =
         typeof subscription.latest_invoice === "string"
           ? await stripe.invoices.retrieve(subscription.latest_invoice, {
               expand: ["payment_intent", "payment_intent.charges", "lines"],
             })
-          : (subscription.latest_invoice as Stripe.Invoice);
+          : subscription.latest_invoice;
 
       if (invoiceObj) {
         await insertReceiptRow({
@@ -756,13 +653,12 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
       }
     }
 
-    const paymentIntentSecret =
-      (invoiceObj?.payment_intent as any)?.client_secret || null;
+    const paymentIntentSecret = invoiceObj?.payment_intent?.client_secret || null;
 
     res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      latestInvoiceId: (invoiceObj as any)?.id || null,
+      latestInvoiceId: invoiceObj?.id || null,
       currentPeriodStart: ts(subscription.current_period_start),
       currentPeriodEnd: ts(subscription.current_period_end),
       paymentIntentClientSecret: paymentIntentSecret,
@@ -774,7 +670,7 @@ router.post("/subscribe", async (req: Request<unknown, unknown, SubscribeBody>, 
 });
 
 /** Billing portal */
-router.post("/portal", async (req: Request, res: Response) => {
+router.post("/portal", async (req, res) => {
   try {
     const { businessId, returnUrl } = req.body || {};
     if (!businessId || !returnUrl) {
@@ -796,20 +692,12 @@ router.post("/portal", async (req: Request, res: Response) => {
 });
 
 // ============================ WEBHOOK HANDLER ============================
-/**
- * Wire this in app entry with express.raw:
- *   import bodyParser from 'body-parser';
- *   import billingRouter, { billingWebhook } from './routes/billingRoutes';
- *   app.use('/billing', billingRouter);
- *   app.post('/billing/webhook', bodyParser.raw({ type: 'application/json' }), billingWebhook);
- */
-export async function billingWebhook(req: Request, res: Response) {
-  const sig = req.headers["stripe-signature"] as string;
-  let event: Stripe.Event;
-
+export async function billingWebhook(req, res) {
+  const sig = req.headers["stripe-signature"];
+  let event;
   try {
-    const rawBody = (req as any).body ?? (req as any).rawBody; // express.raw supplies Buffer
-    event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET as string);
+    const rawBody = req.body ?? req.rawBody; // express.raw supplies Buffer
+    event = stripe.webhooks.constructEvent(rawBody, sig, process.env.STRIPE_WEBHOOK_SECRET);
   } catch (err) {
     console.error("Webhook signature verification failed:", stringify(err));
     return res.status(400).send(`Webhook Error: ${stringify(err)}`);
@@ -820,7 +708,7 @@ export async function billingWebhook(req: Request, res: Response) {
       case "customer.subscription.created":
       case "customer.subscription.updated":
       case "customer.subscription.deleted": {
-        const sub = event.data.object as Stripe.Subscription;
+        const sub = event.data.object;
 
         const business = await getBusinessByStripeCustomerId(String(sub.customer));
 
@@ -830,8 +718,8 @@ export async function billingWebhook(req: Request, res: Response) {
           .eq("stripe_subscription_id", sub.id)
           .single();
 
-        const userId = (localSub as any)?.user_id ?? null;
-        const businessId = (localSub as any)?.business_id ?? business?.id ?? null;
+        const userId = localSub?.user_id ?? null;
+        const businessId = localSub?.business_id ?? business?.id ?? null;
 
         if (!businessId) {
           console.warn("No businessId found for subscription", sub.id);
@@ -843,30 +731,25 @@ export async function billingWebhook(req: Request, res: Response) {
           userId,
           stripeCustomerId: String(sub.customer),
           subscription: sub,
-          tier: (sub.items?.data?.[0]?.price as any)?.nickname || sub.metadata?.tierId || null,
+          tier: sub.items?.data?.[0]?.price?.nickname || sub.metadata?.tierId || null,
           billingMode: "monthly",
           totals: { drivers: 0, stopsHundreds: 0 },
         });
 
-        // Refresh items snapshot
         try {
-          const subscriptionIdLocal = (localSub as any)?.id as number | undefined;
+          const subscriptionIdLocal = localSub?.id;
           if (subscriptionIdLocal) {
             await supabase.from("SubscriptionItems").delete().eq("subscription_id", subscriptionIdLocal);
             await recordSubscriptionItems({
-              businessId,
-              subscriptionIdLocal,
-              subscription: sub,
-              tierId: sub.metadata?.tierId || null,
+              businessId, subscriptionIdLocal, subscription: sub, tierId: sub.metadata?.tierId || null,
             });
           }
         } catch {}
-
         break;
       }
 
       case "invoice.payment_succeeded": {
-        const inv = event.data.object as Stripe.Invoice;
+        const inv = event.data.object;
 
         const { data: localSub } = await supabase
           .from("Subscriptions")
@@ -874,34 +757,33 @@ export async function billingWebhook(req: Request, res: Response) {
           .eq("stripe_subscription_id", inv.subscription)
           .single();
 
-        let businessId = (localSub as any)?.business_id || null;
+        let businessId = localSub?.business_id || null;
         if (!businessId) {
           const biz = await getBusinessByStripeCustomerId(String(inv.customer));
           businessId = biz?.id || null;
         }
 
-        if (!businessId || !(localSub as any)?.id) {
+        if (!businessId || !localSub?.id) {
           console.warn("invoice.payment_succeeded: cannot map local subscription/business", inv.id);
           break;
         }
 
         await insertReceiptRow({
           businessId,
-          subscriptionId: (localSub as any).id as number,
+          subscriptionId: localSub.id,
           invoice: inv,
         });
 
         await supabase
           .from("Subscriptions")
           .update({ last_payment_at: new Date(), updated_at: new Date() })
-          .eq("id", (localSub as any).id);
+          .eq("id", localSub.id);
         break;
       }
 
-      case "invoice.payment_failed": {
+      case "invoice.payment_failed":
         // optional: mark past_due / notify owner
         break;
-      }
 
       default:
         break;
