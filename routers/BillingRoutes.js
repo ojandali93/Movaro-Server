@@ -518,7 +518,7 @@ router.post("/subscribe", async (req, res) => {
           payment_method_id:
             (pi?.payment_method && typeof pi.payment_method === "string")
               ? pi.payment_method
-              : (pi?.payment_method as any)?.id || null,
+              : (pi?.payment_method)?.id || null,
           pm_brand: charge?.payment_method_details?.card?.brand || null,
           pm_last4: charge?.payment_method_details?.card?.last4 || null,
           pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
