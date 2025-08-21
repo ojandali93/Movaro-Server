@@ -553,7 +553,7 @@ router.post("/subscribe", async (req, res) => {
 });
 
 
-app.post('/stripe/webhook',
+router.post('/stripe/webhook',
   express.raw({ type: 'application/json' }),
   async (req, res) => {
     let event;
