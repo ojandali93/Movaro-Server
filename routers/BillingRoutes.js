@@ -336,7 +336,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 3) Build subscription items (base + add-ons)
-    const items: Array<{ price: string; quantity: number }> = [];
+    const items = [];
 
     // Base: use mapped price or ad-hoc cents
     if (Number.isFinite(plan.baseAmountCents)) {
@@ -355,7 +355,7 @@ router.post("/subscribe", async (req, res) => {
 
     // Add-ons
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
-    const normalizedAddons: Array<{ kind: string; quantity: number; unitCents: number; priceId: string }> = [];
+    const normalizedAddons = [];
     for (const a of addonsArr) {
       const kind = String(a?.kind || "").toLowerCase();
       if (!["driver", "stops100"].includes(kind)) continue;
@@ -418,7 +418,7 @@ router.post("/subscribe", async (req, res) => {
     const stopsHundredsQty = normalizedAddons.find(a => a.kind === "stops100")?.quantity || 0;
 
     const periodAmountCents = (subscription.items?.data || []).reduce(
-      (sum, it: any) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+      (sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
       0
     );
 
@@ -457,7 +457,7 @@ router.post("/subscribe", async (req, res) => {
       .eq("stripe_subscription_id", subscription.id)
       .single();
 
-    let localSubId: number | null = null;
+    let localSubId = null;
     if (existing?.id) {
       await supabase.from("Subscriptions")
         .update(subPayload)
@@ -473,16 +473,16 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 7) Extract PI client_secret (so the app can confirm) + save receipt row
-    let paymentIntentClientSecret: string | null = null;
+    let paymentIntentClientSecret = null;
 
     const inv = typeof subscription.latest_invoice === "object"
-      ? (subscription.latest_invoice as Stripe.Invoice)
+      ? (subscription.latest_invoice)
       : null;
 
     if (inv) {
       const pi =
         inv.payment_intent && typeof inv.payment_intent === "object"
-          ? (inv.payment_intent as Stripe.PaymentIntent)
+          ? (inv.payment_intent)
           : null;
 
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
@@ -536,7 +536,7 @@ router.post("/subscribe", async (req, res) => {
     // 7b) Optional fallback: if there was no PI (very rare), try to pay invoice server-side
     if (!paymentIntentClientSecret && typeof subscription.latest_invoice === "string") {
       const paid = await stripe.invoices.pay(subscription.latest_invoice, { expand: ["payment_intent"] });
-      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent as Stripe.PaymentIntent) : null;
+      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent) : null;
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
     }
 
@@ -564,12 +564,12 @@ app.post('/stripe/webhook',
         process.env.STRIPE_WEBHOOK_SECRET
       );
     } catch (err) {
-      return res.status(400).send(`Webhook Error: ${(err as any).message}`);
+      return res.status(400).send(`Webhook Error: ${(err).message}`);
     }
 
     switch (event.type) {
       case 'invoice.payment_succeeded': {
-        const inv = event.data.object as Stripe.Invoice;
+        const inv = event.data.object;
         const subId = typeof inv.subscription === 'string'
           ? inv.subscription
           : inv.subscription?.id;
@@ -588,7 +588,7 @@ app.post('/stripe/webhook',
         break;
       }
       case 'invoice.payment_failed': {
-        const inv = event.data.object as Stripe.Invoice;
+        const inv = event.data.object;
         const subId = typeof inv.subscription === 'string'
           ? inv.subscription
           : inv.subscription?.id;
@@ -599,7 +599,7 @@ app.post('/stripe/webhook',
       }
       case 'customer.subscription.updated':
       case 'customer.subscription.deleted': {
-        const sub = event.data.object as Stripe.Subscription;
+        const sub = event.data.object;
         await supabase.from('Subscriptions')
           .update({
             status: sub.status,
