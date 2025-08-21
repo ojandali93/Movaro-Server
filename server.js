@@ -39,6 +39,7 @@ app.use('/notifications', NotificationRoutes);
 app.get('/health', (req, res) => res.send('✅ Marhaba backend is running'));
 app.use('/billing', billingRouter);
 
+
 // --- SERVER START ---
 server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
