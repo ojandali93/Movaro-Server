@@ -477,7 +477,7 @@ router.post("/subscribe", async (req, res) => {
       latest_invoice_id:
         typeof subscription.latest_invoice === "string"
           ? subscription.latest_invoice
-          : (subscription.latest_invoice as any)?.id || null,
+          : (subscription.latest_invoice)?.id || null,
       metadata: subscription.metadata || {},
       updated_at: new Date(),
     };
@@ -505,7 +505,7 @@ router.post("/subscribe", async (req, res) => {
     }
 
     // 7) Extract PI client_secret (so the app can confirm) + save receipt ------
-    let paymentIntentClientSecre = null;
+    let paymentIntentClientSecret = null;
 
     const inv = typeof subscription.latest_invoice === "object"
       ? (subscription.latest_invoice)
@@ -567,7 +567,7 @@ router.post("/subscribe", async (req, res) => {
     // 7b) Optional: if no PI, try to pay invoice server-side (rare)
     if (!paymentIntentClientSecret && typeof subscription.latest_invoice === "string") {
       const paid = await stripe.invoices.pay(subscription.latest_invoice, { expand: ["payment_intent"] });
-      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent as Stripe.PaymentIntent) : null;
+      const pi = typeof paid.payment_intent === "object" ? (paid.payment_intent) : null;
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
     }
 
