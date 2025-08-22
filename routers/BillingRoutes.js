@@ -981,38 +981,84 @@ export async function stripeWebhookHandler(req, res) {
 
 // GET /billing/summary?businessId=123
 router.get('/summary', async (req, res) => {
-  try {
-    const businessId = req.query.businessId;
-    if (!businessId) return res.status(400).json({ ok:false, error:'Missing businessId' });
+  // Correlated request id for easier tracing across logs
+  const reqId = `sum-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+  const log = (...args: any[]) => console.log('[billing/summary]', reqId, ...args);
 
-    const biz = await loadBusinessRow(businessId);
+  try {
+    const businessId = req.query.businessId as string | undefined;
+    log('start', { businessId });
+
+    if (!businessId) {
+      log('missing businessId');
+      return res.status(400).json({ ok: false, error: 'Missing businessId' });
+    }
+
+    // Load business / customer
+    let biz: any;
+    try {
+      biz = await loadBusinessRow(businessId);
+      log('business loaded', { id: biz?.id, stripe_customer_id: biz?.stripe_customer_id });
+    } catch (e: any) {
+      log('loadBusinessRow error', e?.message || e);
+      return res.status(404).json({ ok: false, error: 'Business not found' });
+    }
+
     if (!biz?.stripe_customer_id) {
-      return res.json({ ok:true, subscription:null, paymentMethods:[], invoiceOpen:null, usage:null, customerId:null });
+      log('no stripe_customer_id mapped for business');
+      return res.json({
+        ok: true,
+        customerId: null,
+        subscription: null,
+        paymentMethods: [],
+        invoiceOpen: null,
+        usage: null,
+      });
     }
 
     const customerId = biz.stripe_customer_id;
 
-    // Pull the most recent subscription row you already maintain
-    const { data: subRow } = await supabase
+    // Pull most recent local Subscriptions row
+    log('querying Subscriptions (local cache) for customer', { customerId });
+    const { data: subRow, error: subRowError } = await supabase
       .from('Subscriptions')
       .select('*')
       .eq('stripe_customer_id', customerId)
-      .order('updated_at', { ascending:false })
+      .order('updated_at', { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    // Fallback to Stripe if needed
-    let stripeSub = null;
+    if (subRowError) log('supabase Subscriptions maybeSingle error', subRowError.message || subRowError);
+    log('subRow result', {
+      found: !!subRow,
+      stripe_subscription_id: subRow?.stripe_subscription_id || null,
+      status: subRow?.status || null,
+    });
+
+    // If missing locally, fall back to Stripe
+    let stripeSub: Stripe.Subscription | null = null;
     if (!subRow) {
-      const list = await stripe.subscriptions.list({ customer: customerId, status:'all', limit: 1, expand: ['data.latest_invoice.payment_intent'] });
-      stripeSub = list.data[0] || null;
+      log('no local subRow; listing Stripe subscriptions…');
+      const list = await stripe.subscriptions.list({
+        customer: customerId,
+        status: 'all',
+        limit: 1,
+        expand: ['data.latest_invoice.payment_intent'],
+      });
+      log('Stripe subscriptions.list result', { count: list?.data?.length || 0 });
+      stripeSub = list.data?.[0] || null;
+      if (stripeSub) {
+        log('picked Stripe sub', { id: stripeSub.id, status: stripeSub.status });
+      } else {
+        log('no Stripe subscriptions found for customer');
+      }
     }
 
-    // Usage: prefer your DB counters; fallback to totals - left
+    // Build usage (prefer local “totals/lefts”)
     const totalDrivers = subRow?.total_drivers ?? 0;
-    const totalStops   = subRow?.total_stops   ?? 0;
-    const driversLeft  = subRow?.drivers_left  ?? totalDrivers;
-    const stopsLeft    = subRow?.stops_left    ?? totalStops;
+    const totalStops = subRow?.total_stops ?? 0;
+    const driversLeft = subRow?.drivers_left ?? totalDrivers;
+    const stopsLeft = subRow?.stops_left ?? totalStops;
 
     const usage = {
       driversTotal: totalDrivers,
@@ -1023,12 +1069,19 @@ router.get('/summary', async (req, res) => {
       stopsLeft: Math.max(0, stopsLeft),
       asOf: new Date().toISOString(),
     };
+    log('usage computed', usage);
 
-    // Payment methods + default
+    // Payment methods & default
+    log('retrieving Stripe customer for default PM…');
     const cust = await stripe.customers.retrieve(customerId);
-    // @ts-ignore
+    // @ts-ignore (Stripe types allow string|object)
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
-    const pms = await stripe.paymentMethods.list({ customer: customerId, type:'card' });
+    const defaultPMId = typeof defaultPM === 'string' ? defaultPM : defaultPM?.id || null;
+    log('default payment method', { defaultPMId });
+
+    log('listing Stripe payment methods…');
+    const pms = await stripe.paymentMethods.list({ customer: customerId, type: 'card' });
+    log('paymentMethods count', pms.data?.length || 0);
 
     const paymentMethods = (pms.data || []).map(pm => ({
       id: pm.id,
@@ -1036,56 +1089,104 @@ router.get('/summary', async (req, res) => {
       last4: pm.card?.last4 || '',
       exp_month: pm.card?.exp_month || null,
       exp_year: pm.card?.exp_year || null,
-      isDefault: (typeof defaultPM === 'string' ? defaultPM : defaultPM?.id) === pm.id,
+      isDefault: defaultPMId === pm.id,
     }));
+    // Safe to log card tails only
+    log('paymentMethods summarized', paymentMethods.map(pm => ({ id: pm.id, last4: pm.last4, isDefault: pm.isDefault })));
 
-    // Find an open invoice (unpaid) for "Pay now"
-    const invs = await stripe.invoices.list({ customer: customerId, status: 'open', limit: 1, expand:['data.payment_intent'] });
+    // Open invoice (unpaid) if any
+    log('listing open invoices…');
+    const invs = await stripe.invoices.list({
+      customer: customerId,
+      status: 'open',
+      limit: 1,
+      expand: ['data.payment_intent'],
+    });
     const inv = invs.data?.[0] || null;
-    const invoiceOpen = inv ? {
-      id: inv.id,
-      amount_due_cents: inv.amount_due || 0,
-      created_at: inv.created ? new Date(inv.created * 1000).toISOString() : null,
-      status: inv.status,
-      hosted_invoice_url: inv.hosted_invoice_url || null,
-      invoice_pdf_url: inv.invoice_pdf || null,
-    } : null;
+    log('open invoices count', invs.data?.length || 0, inv ? { id: inv.id, amount_due: inv.amount_due } : {});
+    const invoiceOpen = inv
+      ? {
+          id: inv.id,
+          amount_due_cents: inv.amount_due || 0,
+          created_at: inv.created ? new Date(inv.created * 1000).toISOString() : null,
+          status: inv.status,
+          hosted_invoice_url: inv.hosted_invoice_url || null,
+          invoice_pdf_url: inv.invoice_pdf || null,
+        }
+      : null;
 
-    // Compose subscription summary
-    const subscription = subRow ? {
-      stripe_subscription_id: subRow.stripe_subscription_id,
-      status: subRow.status,
-      tier: subRow.tier,
-      billing_mode: subRow.billing_mode,
-      current_period_start: subRow.current_period_start,
-      current_period_end: subRow.current_period_end,
-      cancel_at_period_end: subRow.cancel_at_period_end,
-      payment_amount_cents: subRow.payment_amount_cents,
-      last_payment_at: subRow.last_payment_at,
-      latest_invoice_id: subRow.latest_invoice_id,
-      total_drivers: subRow.total_drivers,
-      total_stops: subRow.total_stops,
-    } : (stripeSub ? {
-      stripe_subscription_id: stripeSub.id,
-      status: stripeSub.status,
-      tier: (stripeSub.metadata)?.tierId || null,
-      billing_mode: (stripeSub.metadata)?.billingMode || null,
-      current_period_start: stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
-      current_period_end: stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
-      cancel_at_period_end: !!stripeSub.cancel_at_period_end,
-      payment_amount_cents: (stripeSub.items?.data || []).reduce((s, it)=> s + ((it.price?.unit_amount||0) * (it.quantity||1)), 0),
-      last_payment_at: null,
-      latest_invoice_id: typeof stripeSub.latest_invoice === 'string' ? stripeSub.latest_invoice : stripeSub.latest_invoice?.id || null,
-      total_drivers: 0,
-      total_stops: 0,
-    } : null);
+    // Compose subscription summary (prefer local cache)
+    let subscription: any = null;
+    if (subRow) {
+      subscription = {
+        stripe_subscription_id: subRow.stripe_subscription_id,
+        status: subRow.status,
+        tier: subRow.tier,
+        billing_mode: subRow.billing_mode,
+        current_period_start: subRow.current_period_start,
+        current_period_end: subRow.current_period_end,
+        cancel_at_period_end: subRow.cancel_at_period_end,
+        payment_amount_cents: subRow.payment_amount_cents,
+        last_payment_at: subRow.last_payment_at,
+        latest_invoice_id: subRow.latest_invoice_id,
+        total_drivers: subRow.total_drivers,
+        total_stops: subRow.total_stops,
+      };
+      log('subscription from local cache', {
+        id: subscription.stripe_subscription_id,
+        status: subscription.status,
+        amount: subscription.payment_amount_cents,
+        totals: { drivers: subscription.total_drivers, stops: subscription.total_stops },
+      });
+    } else if (stripeSub) {
+      subscription = {
+        stripe_subscription_id: stripeSub.id,
+        status: stripeSub.status,
+        tier: (stripeSub.metadata as any)?.tierId || null,
+        billing_mode: (stripeSub.metadata as any)?.billingMode || null,
+        current_period_start: stripeSub.current_period_start
+          ? new Date(stripeSub.current_period_start * 1000)
+          : null,
+        current_period_end: stripeSub.current_period_end
+          ? new Date(stripeSub.current_period_end * 1000)
+          : null,
+        cancel_at_period_end: !!stripeSub.cancel_at_period_end,
+        payment_amount_cents: (stripeSub.items?.data || []).reduce(
+          (s, it) => s + ((it.price?.unit_amount || 0) * (it.quantity || 1)),
+          0
+        ),
+        last_payment_at: null,
+        latest_invoice_id:
+          typeof stripeSub.latest_invoice === 'string'
+            ? stripeSub.latest_invoice
+            : stripeSub.latest_invoice?.id || null,
+        total_drivers: 0,
+        total_stops: 0,
+      };
+      log('subscription from Stripe fallback', {
+        id: subscription.stripe_subscription_id,
+        status: subscription.status,
+        amount: subscription.payment_amount_cents,
+      });
+    } else {
+      log('no subscription found (local or Stripe)');
+    }
 
-    return res.json({ ok:true, customerId, subscription, paymentMethods, invoiceOpen, usage });
-  } catch (e) {
-    console.error('summary error:', e);
-    return res.status(500).json({ ok:false, error:'summary_failed', detail:String(e?.message||e) });
+    log('responding');
+    return res.json({
+      ok: true,
+      customerId,
+      subscription,
+      paymentMethods,
+      invoiceOpen,
+      usage,
+    });
+  } catch (e: any) {
+    console.error('[billing/summary]', 'fatal', e?.message || e, e?.stack || '');
+    return res.status(500).json({ ok: false, error: 'summary_failed', detail: String(e?.message || e) });
   }
 });
+
 
 // POST /billing/payment-methods/default
 // body: { businessId: string|number, paymentMethodId: string }
