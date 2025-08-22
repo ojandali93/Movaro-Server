@@ -583,8 +583,25 @@ router.post("/subscribe", async (req, res) => {
   }
 });
 
+router.post('/invoices/:invoiceId/pay', async (req, res) => {
+  try {
+    const { invoiceId } = req.params;
+    if (!invoiceId) return res.status(400).json({ ok: false, error: 'Missing invoiceId' });
+
+    const paid = await stripe.invoices.pay(invoiceId, { expand: ['payment_intent'] }); // uses default PM
+    const status = paid.status; // 'paid' if success
+    const piStatus = typeof paid.payment_intent === 'object' ? paid.payment_intent?.status : null;
+
+    return res.json({ ok: true, invoiceStatus: status, paymentIntentStatus: piStatus });
+  } catch (e) {
+    // surfaces decline codes in Stripe error if any
+    console.error('invoice pay error:', e);
+    return res.status(400).json({ ok: false, error: 'pay_failed', detail: String(e?.message || e) });
+  }
+});
+
 // GET /billing/history?businessId=123&limit=20&cursor=<iso or id>
-router.get('/billing/history', async (req, res) => {
+router.get('/history', async (req, res) => {
   try {
     const businessId = req.query.businessId;
     const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 20));
