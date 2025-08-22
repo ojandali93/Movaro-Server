@@ -1081,7 +1081,7 @@ router.get('/summary', async (req, res) => {
     } : null);
 
     return res.json({ ok:true, customerId, subscription, paymentMethods, invoiceOpen, usage });
-  } catch (e:any) {
+  } catch (e) {
     console.error('summary error:', e);
     return res.status(500).json({ ok:false, error:'summary_failed', detail:String(e?.message||e) });
   }
