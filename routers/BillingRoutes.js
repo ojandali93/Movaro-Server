@@ -979,5 +979,235 @@ export async function stripeWebhookHandler(req, res) {
   }
 }
 
+// GET /billing/summary?businessId=123
+router.get('/summary', async (req, res) => {
+  try {
+    const businessId = req.query.businessId;
+    if (!businessId) return res.status(400).json({ ok:false, error:'Missing businessId' });
+
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) {
+      return res.json({ ok:true, subscription:null, paymentMethods:[], invoiceOpen:null, usage:null, customerId:null });
+    }
+
+    const customerId = biz.stripe_customer_id;
+
+    // Pull the most recent subscription row you already maintain
+    const { data: subRow } = await supabase
+      .from('Subscriptions')
+      .select('*')
+      .eq('stripe_customer_id', customerId)
+      .order('updated_at', { ascending:false })
+      .limit(1)
+      .maybeSingle();
+
+    // Fallback to Stripe if needed
+    let stripeSub = null;
+    if (!subRow) {
+      const list = await stripe.subscriptions.list({ customer: customerId, status:'all', limit: 1, expand: ['data.latest_invoice.payment_intent'] });
+      stripeSub = list.data[0] || null;
+    }
+
+    // Usage: prefer your DB counters; fallback to totals - left
+    const totalDrivers = subRow?.total_drivers ?? 0;
+    const totalStops   = subRow?.total_stops   ?? 0;
+    const driversLeft  = subRow?.drivers_left  ?? totalDrivers;
+    const stopsLeft    = subRow?.stops_left    ?? totalStops;
+
+    const usage = {
+      driversTotal: totalDrivers,
+      driversUsed: Math.max(0, totalDrivers - driversLeft),
+      driversLeft: Math.max(0, driversLeft),
+      stopsTotal: totalStops,
+      stopsUsed: Math.max(0, totalStops - stopsLeft),
+      stopsLeft: Math.max(0, stopsLeft),
+      asOf: new Date().toISOString(),
+    };
+
+    // Payment methods + default
+    const cust = await stripe.customers.retrieve(customerId);
+    // @ts-ignore
+    const defaultPM = cust?.invoice_settings?.default_payment_method || null;
+    const pms = await stripe.paymentMethods.list({ customer: customerId, type:'card' });
+
+    const paymentMethods = (pms.data || []).map(pm => ({
+      id: pm.id,
+      brand: pm.card?.brand || 'card',
+      last4: pm.card?.last4 || '',
+      exp_month: pm.card?.exp_month || null,
+      exp_year: pm.card?.exp_year || null,
+      isDefault: (typeof defaultPM === 'string' ? defaultPM : defaultPM?.id) === pm.id,
+    }));
+
+    // Find an open invoice (unpaid) for "Pay now"
+    const invs = await stripe.invoices.list({ customer: customerId, status: 'open', limit: 1, expand:['data.payment_intent'] });
+    const inv = invs.data?.[0] || null;
+    const invoiceOpen = inv ? {
+      id: inv.id,
+      amount_due_cents: inv.amount_due || 0,
+      created_at: inv.created ? new Date(inv.created * 1000).toISOString() : null,
+      status: inv.status,
+      hosted_invoice_url: inv.hosted_invoice_url || null,
+      invoice_pdf_url: inv.invoice_pdf || null,
+    } : null;
+
+    // Compose subscription summary
+    const subscription = subRow ? {
+      stripe_subscription_id: subRow.stripe_subscription_id,
+      status: subRow.status,
+      tier: subRow.tier,
+      billing_mode: subRow.billing_mode,
+      current_period_start: subRow.current_period_start,
+      current_period_end: subRow.current_period_end,
+      cancel_at_period_end: subRow.cancel_at_period_end,
+      payment_amount_cents: subRow.payment_amount_cents,
+      last_payment_at: subRow.last_payment_at,
+      latest_invoice_id: subRow.latest_invoice_id,
+      total_drivers: subRow.total_drivers,
+      total_stops: subRow.total_stops,
+    } : (stripeSub ? {
+      stripe_subscription_id: stripeSub.id,
+      status: stripeSub.status,
+      tier: (stripeSub.metadata)?.tierId || null,
+      billing_mode: (stripeSub.metadata)?.billingMode || null,
+      current_period_start: stripeSub.current_period_start ? new Date(stripeSub.current_period_start * 1000) : null,
+      current_period_end: stripeSub.current_period_end ? new Date(stripeSub.current_period_end * 1000) : null,
+      cancel_at_period_end: !!stripeSub.cancel_at_period_end,
+      payment_amount_cents: (stripeSub.items?.data || []).reduce((s, it)=> s + ((it.price?.unit_amount||0) * (it.quantity||1)), 0),
+      last_payment_at: null,
+      latest_invoice_id: typeof stripeSub.latest_invoice === 'string' ? stripeSub.latest_invoice : stripeSub.latest_invoice?.id || null,
+      total_drivers: 0,
+      total_stops: 0,
+    } : null);
+
+    return res.json({ ok:true, customerId, subscription, paymentMethods, invoiceOpen, usage });
+  } catch (e:any) {
+    console.error('summary error:', e);
+    return res.status(500).json({ ok:false, error:'summary_failed', detail:String(e?.message||e) });
+  }
+});
+
+// POST /billing/payment-methods/default
+// body: { businessId: string|number, paymentMethodId: string }
+router.post('/payment-methods/default', async (req, res) => {
+  try {
+    const { businessId, paymentMethodId } = req.body || {};
+    if (!businessId || !paymentMethodId) return res.status(400).json({ ok:false, error:'Missing params' });
+
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) return res.status(404).json({ ok:false, error:'Missing Stripe customer' });
+
+    // Attach PM to customer if not already attached
+    try {
+      await stripe.paymentMethods.attach(paymentMethodId, { customer: biz.stripe_customer_id });
+    } catch (_) { /* if already attached, ignore */ }
+
+    const updated = await stripe.customers.update(biz.stripe_customer_id, {
+      invoice_settings: { default_payment_method: paymentMethodId },
+    });
+
+    return res.json({ ok:true, defaultPaymentMethodId: (updated).invoice_settings?.default_payment_method || paymentMethodId });
+  } catch (e) {
+    console.error('set default pm error:', e);
+    return res.status(400).json({ ok:false, error:'set_default_failed', detail:String(e?.message||e) });
+  }
+});
+
+// POST /billing/payment-methods/:pmId/detach
+// body: { businessId }
+router.post('/payment-methods/:pmId/detach', async (req, res) => {
+  try {
+    const { pmId } = req.params;
+    const { businessId } = req.body || {};
+    if (!pmId || !businessId) return res.status(400).json({ ok:false, error:'Missing params' });
+
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) return res.status(404).json({ ok:false, error:'Missing Stripe customer' });
+
+    const cust = await stripe.customers.retrieve(biz.stripe_customer_id);
+    // @ts-ignore
+    const defaultPM = cust?.invoice_settings?.default_payment_method || null;
+    const defaultId = typeof defaultPM === 'string' ? defaultPM : defaultPM?.id;
+
+    if (defaultId === pmId) {
+      return res.status(400).json({ ok:false, error:'cannot_detach_default' });
+    }
+
+    const result = await stripe.paymentMethods.detach(pmId);
+    return res.json({ ok:true, detached: result.id });
+  } catch (e) {
+    console.error('detach pm error:', e);
+    return res.status(400).json({ ok:false, error:'detach_failed', detail:String(e?.message||e) });
+  }
+});
+
+
+// POST /billing/subscription/cancel
+// body: { businessId, atPeriodEnd?: boolean }  (default true)
+router.post('/subscription/cancel', async (req, res) => {
+  try {
+    const { businessId, atPeriodEnd = true } = req.body || {};
+    if (!businessId) return res.status(400).json({ ok:false, error:'Missing businessId' });
+
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) return res.status(404).json({ ok:false, error:'Missing Stripe customer' });
+
+    const subs = await stripe.subscriptions.list({ customer: biz.stripe_customer_id, status:'all', limit:1 });
+    const sub = subs.data[0];
+    if (!sub) return res.status(404).json({ ok:false, error:'No subscription' });
+
+    let updated;
+    if (atPeriodEnd) {
+      updated = await stripe.subscriptions.update(sub.id, { cancel_at_period_end: true });
+    } else {
+      // Immediate cancel
+      updated = await stripe.subscriptions.cancel(sub.id);
+    }
+
+    // Reflect in DB (best-effort)
+    await supabase.from('Subscriptions').update({
+      status: updated.status,
+      cancel_at_period_end: !!updated.cancel_at_period_end,
+      canceled_at: updated.canceled_at ? new Date(updated.canceled_at * 1000) : null,
+      updated_at: new Date(),
+    }).eq('stripe_subscription_id', updated.id);
+
+    return res.json({ ok:true, subscriptionId: updated.id, status: updated.status, cancel_at_period_end: updated.cancel_at_period_end });
+  } catch (e) {
+    console.error('cancel sub error:', e);
+    return res.status(400).json({ ok:false, error:'cancel_failed', detail:String(e?.message||e) });
+  }
+});
+
+// POST /billing/subscription/reactivate
+// body: { businessId }
+router.post('/subscription/reactivate', async (req, res) => {
+  try {
+    const { businessId } = req.body || {};
+    if (!businessId) return res.status(400).json({ ok:false, error:'Missing businessId' });
+
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) return res.status(404).json({ ok:false, error:'Missing Stripe customer' });
+
+    const subs = await stripe.subscriptions.list({ customer: biz.stripe_customer_id, status:'all', limit:1 });
+    const sub = subs.data[0];
+    if (!sub) return res.status(404).json({ ok:false, error:'No subscription' });
+
+    const updated = await stripe.subscriptions.update(sub.id, { cancel_at_period_end: false });
+
+    await supabase.from('Subscriptions').update({
+      status: updated.status,
+      cancel_at_period_end: !!updated.cancel_at_period_end,
+      updated_at: new Date(),
+    }).eq('stripe_subscription_id', updated.id);
+
+    return res.json({ ok:true, subscriptionId: updated.id, status: updated.status, cancel_at_period_end: updated.cancel_at_period_end });
+  } catch (e) {
+    console.error('reactivate sub error:', e);
+    return res.status(400).json({ ok:false, error:'reactivate_failed', detail:String(e?.message||e) });
+  }
+});
+
+
 
 export default router;
