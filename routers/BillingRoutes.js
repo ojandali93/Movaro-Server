@@ -583,6 +583,105 @@ router.post("/subscribe", async (req, res) => {
   }
 });
 
+// GET /billing/history?businessId=123&limit=20&cursor=<iso or id>
+router.get('/billing/history', async (req, res) => {
+  try {
+    const businessId = req.query.businessId;
+    const limit = Math.max(1, Math.min(50, Number(req.query.limit) || 20));
+    const cursor = req.query.cursor; // optional ISO or created_at
+
+    if (!businessId) return res.status(400).json({ error: 'Missing businessId' });
+
+    // Prefer your local receipts table
+    let qb = supabase
+      .from('SubscriptionReceipts')
+      .select(`
+        id,
+        created_at,
+        stripe_invoice_id,
+        stripe_payment_intent_id,
+        stripe_charge_id,
+        billing_reason,
+        invoice_status,
+        payment_intent_status,
+        amount_due_cents,
+        amount_paid_cents,
+        amount_remaining_cents,
+        subtotal_cents,
+        tax_cents,
+        currency,
+        period_start,
+        period_end,
+        hosted_invoice_url,
+        invoice_pdf_url,
+        receipt_url,
+        customer_email,
+        customer_name
+      `)
+      .eq('business_id', businessId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (cursor) {
+      // naive cursor: created_at < cursor
+      qb = qb.lt('created_at', cursor);
+    }
+
+    const { data, error } = await qb;
+    if (error) throw new Error(error.message);
+
+    // If we have rows locally, return those
+    if (data && data.length) {
+      const nextCursor = data.length === limit ? data[data.length - 1].created_at : null;
+      return res.json({ ok: true, source: 'local', items: data, nextCursor });
+    }
+
+    // Fallback to Stripe (if table empty for this biz)
+    // Need the customer id
+    const biz = await loadBusinessRow(businessId);
+    if (!biz?.stripe_customer_id) return res.json({ ok: true, source: 'stripe', items: [], nextCursor: null });
+
+    const invs = await stripe.invoices.list({
+      customer: biz.stripe_customer_id,
+      limit,
+      ...(cursor ? { created: { lt: Math.floor(new Date(cursor).getTime() / 1000) } } : {}),
+      expand: ['data.payment_intent'],
+    });
+
+    const items = (invs.data || []).map((inv) => ({
+      id: null,
+      created_at: inv.created ? new Date(inv.created * 1000).toISOString() : null,
+      stripe_invoice_id: inv.id,
+      stripe_payment_intent_id: typeof inv.payment_intent === 'object' ? inv.payment_intent?.id : inv.payment_intent || null,
+      stripe_charge_id: null,
+      billing_reason: inv.billing_reason || null,
+      invoice_status: inv.status || null,
+      payment_intent_status: typeof inv.payment_intent === 'object' ? inv.payment_intent?.status : null,
+      amount_due_cents: inv.amount_due || 0,
+      amount_paid_cents: inv.amount_paid || 0,
+      amount_remaining_cents: inv.amount_remaining || 0,
+      subtotal_cents: inv.subtotal || 0,
+      tax_cents: inv.tax || 0,
+      currency: inv.currency || 'usd',
+      period_start: inv.lines?.data?.[0]?.period?.start ? new Date(inv.lines.data[0].period.start * 1000).toISOString() : null,
+      period_end:   inv.lines?.data?.[0]?.period?.end   ? new Date(inv.lines.data[0].period.end   * 1000).toISOString() : null,
+      hosted_invoice_url: inv.hosted_invoice_url || null,
+      invoice_pdf_url: inv.invoice_pdf || null,
+      receipt_url: null,
+      customer_email: inv.customer_email || null,
+      customer_name: inv.customer_name || null,
+    }));
+
+    const nextCursor = invs.has_more && invs.data.length
+      ? new Date(invs.data[invs.data.length - 1].created * 1000).toISOString()
+      : null;
+
+    return res.json({ ok: true, source: 'stripe', items, nextCursor });
+  } catch (e) {
+    console.error('history error:', e);
+    return res.status(500).json({ ok: false, error: 'history failed', detail: String(e?.message || e) });
+  }
+});
 
 
 router.post('/stripe/webhook',
