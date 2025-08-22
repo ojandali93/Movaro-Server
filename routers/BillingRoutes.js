@@ -367,7 +367,7 @@ router.post("/subscribe", async (req, res) => {
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
     const normalizedAddons = [];
     for (const a of addonsArr) {
-      const kind = String(a?.kind || "").toLowerCase() as "driver" | "stops100";
+      const kind = String(a?.kind || "").toLowerCase();
       if (!["driver", "stops100"].includes(kind)) continue;
       const quantity = Math.max(0, Math.floor(Number(a?.quantity || 0)));
       if (!quantity) continue;
