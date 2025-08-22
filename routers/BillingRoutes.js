@@ -983,10 +983,10 @@ export async function stripeWebhookHandler(req, res) {
 router.get('/summary', async (req, res) => {
   // Correlated request id for easier tracing across logs
   const reqId = `sum-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
-  const log = (...args: any[]) => console.log('[billing/summary]', reqId, ...args);
+  const log = (...args) => console.log('[billing/summary]', reqId, ...args);
 
   try {
-    const businessId = req.query.businessId as string | undefined;
+    const businessId = req.query.businessId;
     log('start', { businessId });
 
     if (!businessId) {
@@ -995,11 +995,11 @@ router.get('/summary', async (req, res) => {
     }
 
     // Load business / customer
-    let biz: any;
+    let biz;
     try {
       biz = await loadBusinessRow(businessId);
       log('business loaded', { id: biz?.id, stripe_customer_id: biz?.stripe_customer_id });
-    } catch (e: any) {
+    } catch (e) {
       log('loadBusinessRow error', e?.message || e);
       return res.status(404).json({ ok: false, error: 'Business not found' });
     }
@@ -1036,7 +1036,7 @@ router.get('/summary', async (req, res) => {
     });
 
     // If missing locally, fall back to Stripe
-    let stripeSub: Stripe.Subscription | null = null;
+    let stripeSub = null;
     if (!subRow) {
       log('no local subRow; listing Stripe subscriptions…');
       const list = await stripe.subscriptions.list({
@@ -1116,7 +1116,7 @@ router.get('/summary', async (req, res) => {
       : null;
 
     // Compose subscription summary (prefer local cache)
-    let subscription: any = null;
+    let subscription = null;
     if (subRow) {
       subscription = {
         stripe_subscription_id: subRow.stripe_subscription_id,
@@ -1142,8 +1142,8 @@ router.get('/summary', async (req, res) => {
       subscription = {
         stripe_subscription_id: stripeSub.id,
         status: stripeSub.status,
-        tier: (stripeSub.metadata as any)?.tierId || null,
-        billing_mode: (stripeSub.metadata as any)?.billingMode || null,
+        tier: (stripeSub.metadata)?.tierId || null,
+        billing_mode: (stripeSub.metadata)?.billingMode || null,
         current_period_start: stripeSub.current_period_start
           ? new Date(stripeSub.current_period_start * 1000)
           : null,
@@ -1181,7 +1181,7 @@ router.get('/summary', async (req, res) => {
       invoiceOpen,
       usage,
     });
-  } catch (e: any) {
+  } catch (e) {
     console.error('[billing/summary]', 'fatal', e?.message || e, e?.stack || '');
     return res.status(500).json({ ok: false, error: 'summary_failed', detail: String(e?.message || e) });
   }
