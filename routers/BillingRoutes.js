@@ -771,5 +771,213 @@ router.get('/billing/subscriptions/:id', async (req, res) => {
   res.json({ status: sub.status });
 });
 
+/** Safely pull subscription id from a Stripe Invoice or Subscription ref */
+function subIdFromInvoice(inv) {
+  if (!inv) return null;
+  if (typeof inv.subscription === 'string') return inv.subscription;
+  return inv.subscription?.id || null;
+}
+
+function periodFromLines(inv) {
+  const line = inv?.lines?.data?.[0];
+  return {
+    start: line?.period?.start ? new Date(line.period.start * 1000) : null,
+    end: line?.period?.end ? new Date(line.period.end * 1000) : null,
+  };
+}
+
+async function upsertReceiptFromInvoice(inv) {
+  // Expand PI if present so we can store details
+  let pi = null;
+  if (typeof inv.payment_intent === 'object') {
+    pi = inv.payment_intent;
+  }
+
+  const charge = pi?.charges?.data?.[0] || null;
+  const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
+  const card_fingerprint_hash = fingerprint
+    ? crypto.createHash('sha256').update(fingerprint).digest('hex')
+    : null;
+
+  const period = periodFromLines(inv);
+
+  // We don’t necessarily know local subscription_id; store what we can
+  const row = {
+    business_id: (inv.customer) || null, // You can’t map business_id directly from invoice; optional to leave null
+    // If you DO store mapping of stripe_customer_id -> business_id, you can join it first and populate business_id.
+
+    // Store linkage by invoice/subscription — these are the important foreigns
+    stripe_invoice_id: inv.id,
+    stripe_payment_intent_id:
+      (typeof inv.payment_intent === 'string' ? inv.payment_intent : pi?.id) || null,
+    stripe_charge_id: charge?.id || null,
+
+    billing_reason: inv.billing_reason || null,
+    invoice_status: inv.status || null,
+    payment_intent_status: pi?.status || null,
+
+    amount_due_cents: inv.amount_due || 0,
+    amount_paid_cents: inv.amount_paid || 0,
+    amount_remaining_cents: inv.amount_remaining || 0,
+    subtotal_cents: inv.subtotal || 0,
+    tax_cents: inv.tax || 0,
+    currency: inv.currency || 'usd',
+
+    period_start: period.start,
+    period_end: period.end,
+
+    hosted_invoice_url: inv.hosted_invoice_url || null,
+    invoice_pdf_url: inv.invoice_pdf || null,
+    receipt_url: charge?.receipt_url || null,
+
+    payment_method_id:
+      (pi?.payment_method && typeof pi.payment_method === 'string')
+        ? (pi.payment_method as string)
+        : (pi?.payment_method as Stripe.PaymentMethod)?.id || null,
+    pm_brand: charge?.payment_method_details?.card?.brand || null,
+    pm_last4: charge?.payment_method_details?.card?.last4 || null,
+    pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+    pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
+    card_fingerprint_hash,
+
+    customer_email: inv.customer_email || null,
+    customer_name: inv.customer_name || null,
+
+    line_items: inv.lines || null,
+    raw: inv as any,
+    updated_at: new Date(),
+  };
+
+  // Upsert by unique key stripe_invoice_id to avoid duplicates
+  // Make sure you have a unique index on SubscriptionReceipts.stripe_invoice_id
+  const { error } = await supabase
+    .from('SubscriptionReceipts')
+    .upsert(row, { onConflict: 'stripe_invoice_id' });
+
+  if (error) {
+    console.warn('SubscriptionReceipts upsert warn:', error.message);
+  }
+}
+
+async function markSubscription(
+  stripeSubscriptionId,
+  fields
+) {
+  if (!stripeSubscriptionId) return;
+  const { error } = await supabase
+    .from('Subscriptions')
+    .update({ ...fields, updated_at: new Date() })
+    .eq('stripe_subscription_id', stripeSubscriptionId);
+
+  if (error) {
+    console.warn('Subscriptions update warn:', error.message);
+  }
+}
+
+/** Main webhook handler (exported) */
+export async function stripeWebhookHandler(req, res) {
+  const sig = req.headers['stripe-signature'];
+  if (!sig) {
+    return res.status(400).json({ ok: false, error: 'Missing stripe-signature' });
+  }
+
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(
+      req.body,
+      sig,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+  } catch (err) {
+    console.error('Webhook signature verify failed:', err.message);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  try {
+    switch (event.type) {
+      // ========= INVOICES =========
+      case 'invoice.payment_succeeded': {
+        const inv = event.data.object;
+        const subId = subIdFromInvoice(inv);
+
+        await upsertReceiptFromInvoice(inv);
+
+        // Mark subscription active and set period dates + last_payment_at
+        const period = periodFromLines(inv);
+        await markSubscription(subId || '', {
+          status: 'active',
+          last_payment_at: new Date(),
+          current_period_start: period.start,
+          current_period_end: period.end,
+        });
+        break;
+      }
+
+      case 'invoice.payment_failed': {
+        const inv = event.data.object;
+        const subId = subIdFromInvoice(inv);
+
+        await upsertReceiptFromInvoice(inv);
+
+        await markSubscription(subId || '', {
+          status: 'past_due',
+        });
+        break;
+      }
+
+      case 'invoice.finalized': {
+        // Optional: store an early copy (status = 'open') so history shows immediately
+        const inv = event.data.object;
+        await upsertReceiptFromInvoice(inv);
+        break;
+      }
+
+      // ========= SUBSCRIPTIONS =========
+      case 'customer.subscription.created':
+      case 'customer.subscription.updated':
+      case 'customer.subscription.deleted': {
+        const sub = event.data.object;
+
+        await markSubscription(sub.id, {
+          status: sub.status,
+          cancel_at_period_end: !!sub.cancel_at_period_end,
+          canceled_at: sub.canceled_at ? new Date(sub.canceled_at * 1000) : null,
+          current_period_start: sub.current_period_start
+            ? new Date(sub.current_period_start * 1000)
+            : null,
+          current_period_end: sub.current_period_end
+            ? new Date(sub.current_period_end * 1000)
+            : null,
+          // You may also store default_payment_method if present:
+          default_payment_method_id:
+            typeof sub.default_payment_method === 'string'
+              ? sub.default_payment_method
+              : (sub.default_payment_method)?.id || null,
+        });
+        break;
+      }
+
+      // ========= OPTIONAL: PI lifecycle (for debugging or analytics) =========
+      case 'payment_intent.succeeded':
+      case 'payment_intent.payment_failed':
+      case 'payment_intent.processing': {
+        // Usually not needed if invoice events are handled, but you can log if desired
+        break;
+      }
+
+      default:
+        // No-op for other events
+        break;
+    }
+
+    return res.json({ received: true });
+  } catch (err) {
+    console.error('Webhook handler error:', err.message || err);
+    // Return 2xx so Stripe doesn’t retry forever if your DB momentarily fails.
+    // If you prefer retries, return 500 instead – but be sure your handler is idempotent.
+    return res.status(200).json({ received: true, note: 'handled with warnings' });
+  }
+}
+
 
 export default router;
