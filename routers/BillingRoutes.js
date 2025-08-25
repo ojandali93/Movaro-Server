@@ -315,12 +315,6 @@ router.post("/payment-sheet", async (req, res) => {
   }
 });
 
-function addOneYear(d) {
-  const n = new Date(d);
-  n.setFullYear(n.getFullYear() + 1);
-  return n;
-}
-
 router.post('/subscribe', async (req, res) => {
   try {
     const { businessId, userId, plan } = req.body || {};
