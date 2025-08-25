@@ -90,7 +90,6 @@ router.post("/customers", async (req, res) => {
       }
     }
 
-    // Optionally map to Business.stripe_customer_id
     let savedToBusiness = false;
     if (businessId) {
       try {
