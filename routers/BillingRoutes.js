@@ -318,7 +318,7 @@ router.post("/payment-sheet", async (req, res) => {
 
 router.post('/subscribe', async (req, res) => {
   try {
-    const { businessId, userId, plan } = req.body || {};
+    const { businessId, userId, plan, clientIntentId } = req.body || {};
     if (!businessId || !plan?.tierId) {
       return res.status(400).json({ error: 'Missing businessId/plan' });
     }
@@ -339,9 +339,9 @@ router.post('/subscribe', async (req, res) => {
     const createdAt = bizRow.created_at ? new Date(bizRow.created_at) : new Date();
     const eligibleForPromo = createdAt <= new Date(LA_CUTOFF_ISO) && !!PROMO_COUPON_ID;
 
-    // 2) ensure default PM (if none, still OK for $0 invoice; but set later)
+    // 2) ensure default PM (ok if missing when invoice becomes $0)
     const cust = await stripe.customers.retrieve(bizRow.stripe_customer_id);
-    let defaultPM = (cust)?.invoice_settings?.default_payment_method || null;
+    let defaultPM = cust?.invoice_settings?.default_payment_method || null;
     if (!defaultPM) {
       const pms = await stripe.paymentMethods.list({ customer: bizRow.stripe_customer_id, type: 'card' });
       if (pms.data[0]) {
@@ -352,15 +352,23 @@ router.post('/subscribe', async (req, res) => {
       }
     }
 
-    // 3) build subscription items (base + add-ons)   (unchanged from your version)
+    // 3) build subscription items (base + add-ons)
     const items = [];
+
+    // Base (ad-hoc price)
     if (Number.isFinite(plan.baseAmountCents)) {
-      const basePrice = await stripe.prices.create({
-        unit_amount: Math.round(Number(plan.baseAmountCents)),
-        currency: 'usd',
-        recurring: { interval: 'month' },
-        product_data: { name: `Movaro ${plan.tierId} (base)` },
-      });
+      const baseUnit = Math.round(Number(plan.baseAmountCents));
+      const basePrice = await stripe.prices.create(
+        {
+          unit_amount: baseUnit,
+          currency: 'usd',
+          recurring: { interval: 'month' },
+          product_data: { name: `Movaro ${plan.tierId} (base)` },
+          metadata: { type: 'base', tierId: plan.tierId, businessId: String(businessId) },
+        },
+        // idempotent per attempt so a retry of THIS press won’t duplicate
+        { idempotencyKey: safeIdemKey(['price','base', businessId, plan.tierId, baseUnit, clientIntentId || '']) }
+      );
       items.push({ price: basePrice.id, quantity: 1 });
     } else {
       const mapped = TIER_PRICE_REF[plan.tierId]?.priceId;
@@ -368,6 +376,7 @@ router.post('/subscribe', async (req, res) => {
       items.push({ price: mapped, quantity: 1 });
     }
 
+    // Add-ons
     const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
     const normalizedAddons = [];
     for (const a of addonsArr) {
@@ -377,21 +386,25 @@ router.post('/subscribe', async (req, res) => {
       if (!quantity) continue;
       const unitCents = Math.max(0, Math.round(Number(a?.unitCents || 0)));
 
-      const price = await stripe.prices.create({
-        unit_amount: unitCents,
-        currency: 'usd',
-        recurring: { interval: 'month' },
-        product_data: {
-          name: kind === 'driver' ? 'Movaro Driver Add-on' : 'Movaro Stops Add-on (per 100)',
+      const addonPrice = await stripe.prices.create(
+        {
+          unit_amount: unitCents,
+          currency: 'usd',
+          recurring: { interval: 'month' },
+          product_data: {
+            name: kind === 'driver' ? 'Movaro Driver Add-on' : 'Movaro Stops Add-on (per 100)',
+            metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
+          },
           metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
         },
-        metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
-      });
+        { idempotencyKey: safeIdemKey(['price','addon', kind, businessId, plan.tierId, unitCents, clientIntentId || '']) }
+      );
 
-      items.push({ price: price.id, quantity });
-      normalizedAddons.push({ kind, quantity, unitCents, priceId: price.id });
+      items.push({ price: addonPrice.id, quantity });
+      normalizedAddons.push({ kind, quantity, unitCents, priceId: addonPrice.id });
     }
 
+    // IMPORTANT: make the subscription idempotency key unique per button press
     const idemKey = safeIdemKey([
       'sub',
       businessId,
@@ -400,15 +413,15 @@ router.post('/subscribe', async (req, res) => {
       Number(plan.baseAmountCents) || 0,
       ...normalizedAddons.flatMap(a => [a.kind, a.unitCents, a.quantity]),
       eligibleForPromo ? 'promo' : 'nopromo',
+      clientIntentId || Date.now()  // ← new piece
     ]);
 
     // 4) create subscription
-    // When coupon makes invoice $0, Stripe marks the invoice paid and the sub becomes ACTIVE
     const subParams = {
       customer: bizRow.stripe_customer_id,
       items,
       payment_settings: { save_default_payment_method: 'on_subscription' },
-      payment_behavior: 'default_incomplete', // ok; $0 invoice => paid immediately
+      payment_behavior: 'default_incomplete',
       collection_method: 'charge_automatically',
       proration_behavior: 'create_prorations',
       metadata: {
@@ -429,9 +442,7 @@ router.post('/subscribe', async (req, res) => {
       ],
     };
 
-    // Apply promo coupon if eligible
     if (eligibleForPromo) {
-      // `discounts` is the recommended new param (instead of legacy `coupon`)
       subParams.discounts = [{ coupon: PROMO_COUPON_ID }];
     }
 
@@ -449,7 +460,6 @@ router.post('/subscribe', async (req, res) => {
     const periodAmountCents = (subscription.items?.data || [])
       .reduce((sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)), 0);
 
-    // Promo flags
     const promoEndsAt = eligibleForPromo ? addOneYear(createdAt) : null;
     const unlimited = !!eligibleForPromo;
 
@@ -502,26 +512,20 @@ router.post('/subscribe', async (req, res) => {
         .insert({ ...subPayload, created_at: new Date() })
         .select('id')
         .single();
-      localSubId = (ins as any).data?.id ?? null;
+      localSubId = ins.data?.id ?? null;
     }
 
     // 7) save first invoice receipt (may be $0; PI might be null)
     let paymentIntentClientSecret = null;
-
-    const inv = typeof subscription.latest_invoice === 'object'
-      ? subscription.latest_invoice
-      : null;
+    const inv = typeof subscription.latest_invoice === 'object' ? subscription.latest_invoice : null;
 
     if (inv) {
-      const pi = (typeof inv.payment_intent === 'object'
-        ? inv.payment_intent
-        : null)
-
+      const pi = typeof inv.payment_intent === 'object' ? inv.payment_intent : null;
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
 
       if (localSubId) {
         const charge = pi?.charges?.data?.[0] || null;
-        const fingerprint = (charge)?.payment_method_details?.card?.fingerprint || null;
+        const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
         const card_fingerprint_hash = fingerprint
           ? crypto.createHash('sha256').update(fingerprint).digest('hex')
           : null;
@@ -549,11 +553,11 @@ router.post('/subscribe', async (req, res) => {
           receipt_url: charge?.receipt_url || null,
           payment_method_id: (pi?.payment_method && typeof pi.payment_method === 'string')
             ? pi.payment_method
-            : (pi?.payment_method)?.id || null,
-          pm_brand: (charge)?.payment_method_details?.card?.brand || null,
-          pm_last4: (charge)?.payment_method_details?.card?.last4 || null,
-          pm_exp_month: (charge)?.payment_method_details?.card?.exp_month || null,
-          pm_exp_year: (charge)?.payment_method_details?.card?.exp_year || null,
+            : pi?.payment_method?.id || null,
+          pm_brand: charge?.payment_method_details?.card?.brand || null,
+          pm_last4: charge?.payment_method_details?.card?.last4 || null,
+          pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+          pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
           card_fingerprint_hash,
           customer_email: inv.customer_email || null,
           customer_name: inv.customer_name || null,
@@ -564,14 +568,14 @@ router.post('/subscribe', async (req, res) => {
       }
     }
 
-    // 8) respond (PI secret likely null on $0 invoice)
+    // 8) respond
     return res.json({
       subscriptionId: subscription.id,
       status: subscription.status,
-      paymentIntentClientSecret: paymentIntentClientSecret, // may be null
+      paymentIntentClientSecret: paymentIntentClientSecret || null,
       promo: {
         applied: eligibleForPromo,
-        endsAt: promoEndsAt,
+        endsAt: eligibleForPromo ? promoEndsAt : null,
         unlimitedDrivers: unlimited,
         unlimitedStops: unlimited,
       },
@@ -581,6 +585,7 @@ router.post('/subscribe', async (req, res) => {
     return res.status(500).json({ error: 'subscribe failed', detail: String(e?.message || e) });
   }
 });
+
 
 
 
