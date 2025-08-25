@@ -12,7 +12,7 @@ const MOBILE_API_VERSION = "2024-06-20";
 const LA_CUTOFF_ISO = '2025-09-10T23:59:59-07:00'; // PDT cutoff
 const PROMO_COUPON_ID = process.env.STRIPE_PROMO_1Y_COUPON_ID; // coupon_...
 
-function addOneYear(d: Date) {
+function addOneYear(d) {
   const n = new Date(d);
   n.setFullYear(n.getFullYear() + 1);
   return n;
