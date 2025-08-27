@@ -344,9 +344,11 @@ router.post('/subscribe', async (req, res) => {
 
     // NEW: discount window eligibility (Pacific time cutoff encoded in UTC)
     const eligibleForDiscountWindow = new Date() <= new Date(DISCOUNT_CODE_LA_CUTOFF_ISO);
+    console.log('eligibleForDiscountWindow', eligibleForDiscountWindow)
 
     // 2) ensure default PM (same)
     const cust = await stripe.customers.retrieve(bizRow.stripe_customer_id);
+    console.log('customer in stripe: ', cust)
     let defaultPM = cust?.invoice_settings?.default_payment_method || null;
     if (!defaultPM) {
       const pms = await stripe.paymentMethods.list({ customer: bizRow.stripe_customer_id, type: 'card' });
@@ -363,6 +365,8 @@ router.post('/subscribe', async (req, res) => {
     // ---------- Resolve a discount code ONLY if inside the window ----------
     const discountCodeRaw =
       (discountCodeIn || plan?.couponId || DEFAULT_DISCOUNT_CODE || '').toString().trim();
+
+    console.log('discount code rawa; ', discountCodeRaw)
 
     let resolvedDiscount = null;
     let resolvedKind = null;
@@ -407,7 +411,7 @@ router.post('/subscribe', async (req, res) => {
     ]);
 
     // 4) create subscription
-    const subParams: any = {
+    const subParams = {
       customer: bizRow.stripe_customer_id,
       items,
       payment_settings: { save_default_payment_method: 'on_subscription' },
