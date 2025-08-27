@@ -364,9 +364,9 @@ router.post('/subscribe', async (req, res) => {
     const discountCodeRaw =
       (discountCodeIn || plan?.couponId || DEFAULT_DISCOUNT_CODE || '').toString().trim();
 
-    let resolvedDiscount: null | ({ promotion_code: string } | { coupon: string }) = null;
-    let resolvedKind: 'promotion_code' | 'coupon' | null = null;
-    let resolvedId: string | null = null;
+    let resolvedDiscount = null;
+    let resolvedKind = null;
+    let resolvedId = null;
 
     if (!eligibleForPromo && eligibleForDiscountWindow && discountCodeRaw) {
       try {
