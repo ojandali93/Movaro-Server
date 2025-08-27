@@ -23,10 +23,10 @@ const limiter = rateLimit({
   message: 'Too many requests, please try again later.',
 });
 
-app.post('/stripe/webhook',
-  express.raw({ type: 'application/json' }),
-  webhookHandler
-);
+// app.post('/stripe/webhook',
+//   express.raw({ type: 'application/json' }),
+//   webhookHandler
+// );
 
 // Middlewares
 app.use(helmet());
