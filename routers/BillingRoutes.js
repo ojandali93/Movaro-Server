@@ -717,35 +717,35 @@ router.post('/subscribe', async (req, res) => {
 
 
     // Optional: clean up any outstanding custom offers for this business
-    await supabase.from('CustomOffers').delete().eq('business_id', businessId);
+//     await supabase.from('CustomOffers').delete().eq('business_id', businessId);
 
-    // --- 8) Respond ---
-    const promoEnds = eligibleForPromo ? promoEndsAt : null;
+//     // --- 8) Respond ---
+//     const promoEnds = eligibleForPromo ? promoEndsAt : null;
 
-    return res.json({
-      subscriptionId: subscription.id,
-      status: subscription.status,
-      paymentIntentClientSecret: paymentIntentClientSecret || null,
-      discount: {
-        freeYear: eligibleForPromo,
-        windowEligible: eligibleForDiscountWindow,
-        appliedCode: eligibleForPromo ? null : (eligibleForDiscountWindow ? (discountCodeRaw || null) : null),
-        kind: eligibleForPromo ? 'free_year_promo' : (eligibleForDiscountWindow ? (resolvedKind || null) : null),
-        id: eligibleForPromo ? (PROMO_COUPON_ID || null) : (eligibleForDiscountWindow ? (resolvedId || null) : null),
-        cutoffIsoUtc: DISCOUNT_CODE_LA_CUTOFF_ISO,
-      },
-      promo: {
-        applied: eligibleForPromo,
-        endsAt: promoEnds,
-        unlimitedDrivers: !!eligibleForPromo,
-        unlimitedStops: !!eligibleForPromo,
-      },
-    });
-  } catch (e) {
-    console.error('subscribe error', e);
-    return res.status(500).json({ error: 'subscribe failed', detail: String(e?.message || e) });
-  }
-});
+//     return res.json({
+//       subscriptionId: subscription.id,
+//       status: subscription.status,
+//       paymentIntentClientSecret: paymentIntentClientSecret || null,
+//       discount: {
+//         freeYear: eligibleForPromo,
+//         windowEligible: eligibleForDiscountWindow,
+//         appliedCode: eligibleForPromo ? null : (eligibleForDiscountWindow ? (discountCodeRaw || null) : null),
+//         kind: eligibleForPromo ? 'free_year_promo' : (eligibleForDiscountWindow ? (resolvedKind || null) : null),
+//         id: eligibleForPromo ? (PROMO_COUPON_ID || null) : (eligibleForDiscountWindow ? (resolvedId || null) : null),
+//         cutoffIsoUtc: DISCOUNT_CODE_LA_CUTOFF_ISO,
+//       },
+//       promo: {
+//         applied: eligibleForPromo,
+//         endsAt: promoEnds,
+//         unlimitedDrivers: !!eligibleForPromo,
+//         unlimitedStops: !!eligibleForPromo,
+//       },
+//     });
+//   } catch (e) {
+//     console.error('subscribe error', e);
+//     return res.status(500).json({ error: 'subscribe failed', detail: String(e?.message || e) });
+//   }
+// });
 
 
 router.post('/invoices/:invoiceId/pay', async (req, res) => {
