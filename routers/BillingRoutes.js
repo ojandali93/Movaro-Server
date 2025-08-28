@@ -173,6 +173,8 @@ router.post("/payment-sheet", async (req, res) => {
       .eq("id", businessId)
       .single();
 
+    console.log('payment sheet biz top: ', biz)
+
     if (bizErr || !biz) {
       return res.status(404).json({ ok:false, error:"Business not found" });
     }
@@ -180,6 +182,8 @@ router.post("/payment-sheet", async (req, res) => {
     // ---------- 2) Ensure/retrieve Stripe customer ----------
     let customerId = customerIdIn || biz.stripe_customer_id || null;
     let createdNew = false;
+
+    console.log('payment sheet customerId: ', customerId)
 
     if (!customerId && createIfMissing) {
       // Try re-use by email first
@@ -196,6 +200,8 @@ router.post("/payment-sheet", async (req, res) => {
         console.warn("Stripe customers.list warn:", e?.message || e);
       }
 
+      console.log('payment sheet customer: ', customer)
+
       if (!customer) {
         const idemKey = safeIdemKey(["cust", businessId, email]);
         customer = await stripe.customers.create(
@@ -205,14 +211,22 @@ router.post("/payment-sheet", async (req, res) => {
         createdNew = true;
       }
 
+      console.log('payment sheet customerId: ', customerId)
+
       customerId = customer.id;
+
+      console.log('create new record: ', customerId)
 
       // Persist to Business (best effort)
       try {
-        await supabase
+        const response =await supabase
           .from("Business")
           .update({ stripe_customer_id: customerId, updated_at: new Date() })
-          .eq("id", businessId);
+          .eq("id", businessId)
+          .select();
+
+        console.log('update business: ', response)
+
       } catch (e) {
         console.warn("Business mapping update warn:", e?.message || e);
       }
@@ -279,6 +293,8 @@ router.post("/payment-sheet", async (req, res) => {
       .limit(1)
       .maybeSingle();
 
+    console.log('payment sheet pendingRow: ', pendingRow)
+
     const snapshotPayload = {
       business_id: businessId,
       user_id: userId ?? null,
@@ -310,13 +326,18 @@ router.post("/payment-sheet", async (req, res) => {
 
     if (pendingRow?.id) {
       // Refresh the pending row
-      await supabase
+      const response = await supabase
         .from("Subscriptions")
         .update(snapshotPayload)
-        .eq("id", pendingRow.id);
+        .eq("id", pendingRow.id)
+        .select();
+
+      console.log('update pending row: ', response)
     } else {
       // Insert a single pending row for this checkout key
-      await supabase.from("Subscriptions").insert(snapshotPayload);
+      const response = await supabase.from("Subscriptions").insert(snapshotPayload);
+
+      console.log('insert pending row: ', response)
     }
 
     // ---------- 6) Respond ----------
@@ -352,6 +373,8 @@ router.post('/subscribe', async (req, res) => {
       discountCode: discountCodeIn,
       plan,
     } = req.body || {};
+
+    console.log('subscribe req.body: ', req.body)
 
     if (!businessId || !plan?.tierId) {
       return res.status(400).json({ error: 'Missing businessId/plan' });
@@ -603,13 +626,17 @@ router.post('/subscribe', async (req, res) => {
       .limit(1)
       .maybeSingle();
 
+    console.log('pending: ', pending)
+
     let localSubId = null;
 
     if (pending?.id) {
+      console.log('update in place')
       // Update in place (no new row)
       await supabase.from('Subscriptions').update(subPayload).eq('id', pending.id);
       localSubId = pending.id;
     } else {
+      console.log('fallback: upsert by Stripe subscription id')
       // Fallback: upsert by Stripe subscription id
       const { data: existing } = await supabase
         .from('Subscriptions')
@@ -617,12 +644,16 @@ router.post('/subscribe', async (req, res) => {
         .eq('stripe_subscription_id', subscription.id)
         .maybeSingle();
 
+      console.log('existing: ', existing)
+
       if (existing?.id) {
+        console.log('update existing')
         await supabase.from('Subscriptions')
           .update(subPayload)
           .eq('stripe_subscription_id', subscription.id);
         localSubId = existing.id;
       } else {
+        console.log('insert new')
         const ins = await supabase.from('Subscriptions')
           .insert({ ...subPayload, created_at: new Date() })
           .select('id')
