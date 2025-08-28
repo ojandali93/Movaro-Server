@@ -77,7 +77,8 @@ router.post('/send-update-subscription', async (req, res) => {
     username,
     contactEmail,
     contactPhone,
-    notes
+    notes,
+    userId
   } = req.body || {};
 
   // helper: treat null/undefined/empty/whitespace as missing
@@ -163,13 +164,13 @@ router.post('/send-update-subscription', async (req, res) => {
     const { error: dbErr } = await supabase
       .from('UpdateSubscriptionRequests')
       .insert({
-        business_id: bizIdNum,
+        business_id: businessId,
+        user_id: userId,
         stripe_customer_id: stripeCustomerId,
         stripe_subscription_id: stripeSubscriptionId,
         status: 'pending',
         current_tier: currentTier,
         requested_tier: requestedTier,
-        username,
         contact_email: contactEmail,
         contact_phone: contactPhone,
         notes: notes || null,
