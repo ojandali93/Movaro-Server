@@ -113,6 +113,18 @@ router.post('/send-update-subscription', async (req, res) => {
       html: html,
     });
 
+    await supabase.from('UpdateSubscriptionRequest').insert({
+      business_id: businessId,
+      stripe_customer_id: stripeCustomerId,
+      stripe_subscription_id: stripeSubscriptionId,
+      status: 'pending',
+      current_tier: currentTier,
+      requested_tier: requestedTier,
+      username: username,
+      contact_email: contactEmail,
+      contact_phone: contactPhone,
+    }).select();
+
     res.status(200).json({ success: true });
   } catch (error) {
     console.error('Error sending invite email:', error);
