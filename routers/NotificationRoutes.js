@@ -63,25 +63,70 @@ const generateRequestId = () => {
 };
 
 router.post('/send-update-subscription', async (req, res) => {
-  const { to, name, businessName, businessId, stripeCustomerId, stripeSubscriptionId, status, currentTier, requestedTier, username, contactEmail, contactPhone, notes } = req.body;
+  // pull everything (notes is optional)
+  const {
+    to,
+    name,
+    businessName,
+    businessId,
+    stripeCustomerId,
+    stripeSubscriptionId,
+    status,
+    currentTier,
+    requestedTier,
+    username,
+    contactEmail,
+    contactPhone,
+    notes
+  } = req.body || {};
 
-  if (!to || !name || !businessName || !businessId || !stripeCustomerId || !stripeSubscriptionId || !status || !currentTier || !requestedTier || !username || !contactEmail || !contactPhone) {
-    return res.status(400).json({ error: 'Missing required fields.' });
+  // helper: treat null/undefined/empty/whitespace as missing
+  const isBlank = (v) => v === undefined || v === null || (typeof v === 'string' && v.trim() === '');
+
+  // validate required fields
+  const missing = [];
+  if (isBlank(to)) missing.push('to');
+  if (isBlank(name)) missing.push('name');
+  if (isBlank(businessName)) missing.push('businessName');
+
+  // businessId should be a positive number-like value
+  const bizIdNum = Number(businessId);
+  if (!Number.isFinite(bizIdNum) || bizIdNum <= 0) missing.push('businessId');
+
+  if (isBlank(stripeCustomerId)) missing.push('stripeCustomerId');
+  if (isBlank(stripeSubscriptionId)) missing.push('stripeSubscriptionId');
+  if (isBlank(status)) missing.push('status');
+  if (isBlank(currentTier)) missing.push('currentTier');
+  if (isBlank(requestedTier)) missing.push('requestedTier');
+  if (isBlank(username)) missing.push('username');
+
+  // very light email check (optional, but helpful)
+  const emailLike = (e) => typeof e === 'string' && /\S+@\S+\.\S+/.test(e);
+  if (isBlank(contactEmail) || !emailLike(contactEmail)) missing.push('contactEmail');
+  if (isBlank(contactPhone)) missing.push('contactPhone');
+
+  if (missing.length) {
+    return res.status(400).json({
+      ok: false,
+      error: 'missing_or_invalid_fields',
+      missing,                        // <- exactly which fields
+      receivedKeys: Object.keys(req.body || {}), // debugging context
+    });
   }
 
-  console.log('to: ', to);
-  console.log('name: ', name);
-  console.log('businessName: ', businessName);
-  console.log('businessId: ', businessId);
-  console.log('stripeCustomerId: ', stripeCustomerId);
-  console.log('stripeSubscriptionId: ', stripeSubscriptionId);
-  console.log('status: ', status);
-  console.log('currentTier: ', currentTier);
-  console.log('requestedTier: ', requestedTier);
-  console.log('username: ', username);
-  console.log('contactEmail: ', contactEmail);
-  console.log('contactPhone: ', contactPhone);
+  // ====== LOGS (useful during dev) ======
+  console.log('[send-update-subscription] payload', {
+    to, name, businessName, businessId: bizIdNum, stripeCustomerId, stripeSubscriptionId,
+    status, currentTier, requestedTier, username, contactEmail, contactPhone,
+    hasNotes: !!notes,
+  });
+
+  // helper: simple request id for email/debugging
+  const generateRequestId = () =>
+    'usrq_' + Math.random().toString(36).slice(2, 8) + Date.now().toString(36);
+
   try {
+    // --- Mailer (Gmail example) ---
     const transporter = nodemailer.createTransport({
       service: 'Gmail',
       auth: {
@@ -93,13 +138,13 @@ router.post('/send-update-subscription', async (req, res) => {
     const html = `
       <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;">
         <h2>Subscription update requested</h2>
-        <p><strong>Business:</strong> ${businessName} (ID: ${businessId})</p>
+        <p><strong>Business:</strong> ${businessName} (ID: ${bizIdNum})</p>
         <p><strong>Stripe Customer:</strong> ${stripeCustomerId || '(none)'}</p>
         <p><strong>Stripe Subscription:</strong> ${stripeSubscriptionId || '(none)'} — <em>${status || 'n/a'}</em></p>
         <p><strong>Current Tier:</strong> ${currentTier || '(unknown)'}<br/>
            <strong>Requested Tier:</strong> ${requestedTier || '(unspecified)'}</p>
         <p><strong>User:</strong> ${username || '(not provided)'}<br/>
-           <strong>Contact:</strong> ${contactEmail || contactEmail || '(no email)'} • ${contactPhone || phone || '(no phone)'}</p>
+           <strong>Contact:</strong> ${contactEmail || '(no email)'} • ${contactPhone || '(no phone)'}</p>
         ${notes ? `<p><strong>Notes:</strong><br/>${String(notes).replace(/\n/g,'<br/>')}</p>` : ''}
         <hr/>
         <p>Request ID: ${generateRequestId()} • Created: ${new Date().toLocaleString()}</p>
@@ -110,27 +155,39 @@ router.post('/send-update-subscription', async (req, res) => {
       from: process.env.GMAIL_USERNAME,
       to,
       subject: `${businessName} Subscription Update`,
-      html: html,
+      html,
     });
 
-    await supabase.from('UpdateSubscriptionRequest').insert({
-      business_id: businessId,
-      stripe_customer_id: stripeCustomerId,
-      stripe_subscription_id: stripeSubscriptionId,
-      status: 'pending',
-      current_tier: currentTier,
-      requested_tier: requestedTier,
-      username: username,
-      contact_email: contactEmail,
-      contact_phone: contactPhone,
-    }).select();
+    // --- DB insert (ensure your table name matches) ---
+    // Suggested table: "UpdateSubscriptionRequests" (plural)
+    const { error: dbErr } = await supabase
+      .from('UpdateSubscriptionRequests')
+      .insert({
+        business_id: bizIdNum,
+        stripe_customer_id: stripeCustomerId,
+        stripe_subscription_id: stripeSubscriptionId,
+        status: 'pending',
+        current_tier: currentTier,
+        requested_tier: requestedTier,
+        username,
+        contact_email: contactEmail,
+        contact_phone: contactPhone,
+        notes: notes || null,
+        created_at: new Date().toISOString(),
+      });
 
-    res.status(200).json({ success: true });
+    if (dbErr) {
+      console.warn('[send-update-subscription] DB insert warn:', dbErr.message);
+      // still return 200 because email already sent; tweak if you prefer to fail
+    }
+
+    return res.status(200).json({ ok: true, sentEmail: true, saved: !dbErr });
   } catch (error) {
-    console.error('Error sending invite email:', error);
-    res.status(500).json({ error: 'Failed to send email.' });
+    console.error('[send-update-subscription] error:', error);
+    return res.status(500).json({ ok: false, error: 'Failed to send email.' });
   }
 });
+
 
 router.post('/send-custom-plan', async (req, res) => {
   const { to, name, businessName, username, userid, businessId, drivers, stops } = req.body;
