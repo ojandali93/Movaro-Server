@@ -141,30 +141,32 @@ router.post("/customers", async (req, res) => {
 
 /** COMBINED: ensure customer, check card, return PaymentSheet bits if needed */
 // /billing/payment-sheet  (combined: ensure customer + card check + cache snapshot)
+// /billing/payment-sheet
 router.post("/payment-sheet", async (req, res) => {
   try {
     const {
       businessId,
       email,
       name,
-      customerId: customerIdIn,  // optional
-      userId,                    // optional -> Profile.id
-      tier,                      // optional -> e.g. 'starter'
-      billingMode = "monthly",   // optional; default monthly
-      paymentAmountCents,        // optional; number (cents)
-      paymentAmount,             // optional; number (dollars) if you prefer
-      totalDrivers,              // optional
-      totalStops,                // optional
-      driversLeft,               // optional
-      stopsLeft,                 // optional
-      createIfMissing = true,    // ensure Stripe customer exists
+      customerId: customerIdIn, // optional
+      userId,                   // optional -> Profile.id
+      tier,                     // optional -> e.g. 'starter'
+      billingMode = "monthly",  // optional; default monthly
+      paymentAmountCents,       // optional; number (cents)
+      paymentAmount,            // optional; number (dollars)
+      totalDrivers,             // optional
+      totalStops,               // optional
+      driversLeft,              // optional
+      stopsLeft,                // optional
+      createIfMissing = true,
+      clientIntentId,           // <<—— pass from client; ties this call to /subscribe
     } = req.body || {};
 
     if (!businessId || !email) {
-      return res.status(400).json({ ok: false, error: "Missing businessId/email" });
+      return res.status(400).json({ ok:false, error:"Missing businessId/email" });
     }
 
-    // ---------- 1) Load business row ----------
+    // ---------- 1) Load business ----------
     const { data: biz, error: bizErr } = await supabase
       .from("Business")
       .select("id, stripe_customer_id")
@@ -172,7 +174,7 @@ router.post("/payment-sheet", async (req, res) => {
       .single();
 
     if (bizErr || !biz) {
-      return res.status(404).json({ ok: false, error: "Business not found" });
+      return res.status(404).json({ ok:false, error:"Business not found" });
     }
 
     // ---------- 2) Ensure/retrieve Stripe customer ----------
@@ -180,19 +182,17 @@ router.post("/payment-sheet", async (req, res) => {
     let createdNew = false;
 
     if (!customerId && createIfMissing) {
-      // Try to reuse by email first
+      // Try re-use by email first
       let customer = null;
       try {
         const found = await stripe.customers.list({ email, limit: 1 });
         if (found.data[0]) {
           customer = found.data[0];
-          // lightly freshen name
           if (name && customer.name !== name) {
             customer = await stripe.customers.update(customer.id, { name });
           }
         }
       } catch (e) {
-        // non-fatal
         console.warn("Stripe customers.list warn:", e?.message || e);
       }
 
@@ -207,7 +207,7 @@ router.post("/payment-sheet", async (req, res) => {
 
       customerId = customer.id;
 
-      // Persist mapping to Business (idempotent)
+      // Persist to Business (best effort)
       try {
         await supabase
           .from("Business")
@@ -219,12 +219,11 @@ router.post("/payment-sheet", async (req, res) => {
     }
 
     if (!customerId) {
-      return res.status(409).json({ ok: false, error: "missing_customer" });
+      return res.status(409).json({ ok:false, error:"missing_customer" });
     }
 
     // ---------- 3) Check for default payment method ----------
     const cust = await stripe.customers.retrieve(customerId);
-    // @ts-ignore (plain JS)
     const defaultPM = cust?.invoice_settings?.default_payment_method || null;
 
     let hasDefaultPaymentMethod = !!defaultPM;
@@ -234,8 +233,10 @@ router.post("/payment-sheet", async (req, res) => {
     }
 
     // ---------- 4) Prepare PaymentSheet pieces if needed ----------
+    const MOBILE_API_VERSION = "2024-06-20";
     let epkSecret = null;
     let siSecret = null;
+
     if (!hasDefaultPaymentMethod) {
       const epk = await stripe.ephemeralKeys.create(
         { customer: customerId },
@@ -249,8 +250,7 @@ router.post("/payment-sheet", async (req, res) => {
       siSecret = si.client_secret;
     }
 
-    // ---------- 5) Cache a "subscription snapshot" row in Subscriptions ----------
-    // Keep this non-blocking: if it fails we still return success to the client.
+    // ---------- 5) Reserve/refresh ONE local snapshot row keyed by checkout_key ----------
     const amountCents = Number.isFinite(paymentAmountCents)
       ? Math.round(Number(paymentAmountCents))
       : Number.isFinite(paymentAmount)
@@ -258,13 +258,32 @@ router.post("/payment-sheet", async (req, res) => {
       : null;
 
     const asInt = (v) =>
-      v === undefined || v === null || Number.isNaN(Number(v)) ? null : Math.max(0, Math.floor(Number(v)));
+      v === undefined || v === null || Number.isNaN(Number(v))
+        ? null
+        : Math.max(0, Math.floor(Number(v)));
 
-    const snapshot = {
+    const checkoutKey = safeIdemKey([
+      "checkout",
+      businessId,
+      clientIntentId || "once",
+    ]);
+
+    // Try to find existing pending row for this checkout key
+    const { data: pendingRow } = await supabase
+      .from("Subscriptions")
+      .select("id, created_at")
+      .eq("business_id", businessId)
+      .is("stripe_subscription_id", null)
+      .filter("metadata->>checkout_key", "eq", checkoutKey)
+      .order("created_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    const snapshotPayload = {
       business_id: businessId,
       user_id: userId ?? null,
       stripe_customer_id: customerId,
-      stripe_subscription_id: null, // not created yet
+      stripe_subscription_id: null,
       tier: tier || null,
       billing_mode: billingMode || null,
       payment_amount_cents: amountCents,
@@ -279,44 +298,49 @@ router.post("/payment-sheet", async (req, res) => {
       current_period_end: null,
       cancel_at_period_end: false,
       canceled_at: null,
-      default_payment_method_id: defaultPM || null,
+      default_payment_method_id: (typeof defaultPM === "string" ? defaultPM : defaultPM?.id) || null,
       latest_invoice_id: null,
       metadata: {
         source: "payment-sheet",
         createdNewCustomer: !!createdNew,
+        checkout_key: checkoutKey,
       },
       updated_at: new Date(),
-      // created_at is default now()
     };
 
-    try {
-      await supabase.from("Subscriptions").insert(snapshot);
-    } catch (dbErr) {
-      // Not fatal—log and continue. You can tighten this later.
-      console.warn("Subscriptions snapshot insert warn:", dbErr?.message || dbErr);
+    if (pendingRow?.id) {
+      // Refresh the pending row
+      await supabase
+        .from("Subscriptions")
+        .update(snapshotPayload)
+        .eq("id", pendingRow.id);
+    } else {
+      // Insert a single pending row for this checkout key
+      await supabase.from("Subscriptions").insert(snapshotPayload);
     }
 
-    // ---------- 6) Respond (always JSON) ----------
+    // ---------- 6) Respond ----------
     return res.json({
       ok: true,
       hasStripeCustomer: true,
       hasDefaultPaymentMethod,
       customerId,
-      ephemeralKey: epkSecret,                // null if has card
-      setupIntentClientSecret: siSecret,      // null if has card
+      ephemeralKey: epkSecret,               // null if already has card
+      setupIntentClientSecret: siSecret,     // null if already has card
       merchantCountryCode: "US",
       createdNew,
+      checkoutKey,                           // <<— the client can keep it if needed
     });
   } catch (err) {
     console.error("payment-sheet error:", err);
-    // Always JSON to prevent “Unexpected <” on the client
     return res.status(500).json({
-      ok: false,
-      error: "payment-sheet failed",
-      detail: String(err?.message || err),
+      ok:false,
+      error:"payment-sheet failed",
+      detail:String(err?.message || err),
     });
   }
 });
+
 
 
 router.post('/subscribe', async (req, res) => {
@@ -343,12 +367,19 @@ router.post('/subscribe', async (req, res) => {
     if (bizErr || !bizRow) return res.status(404).json({ error: 'Business not found' });
     if (!bizRow.stripe_customer_id) return res.status(409).json({ error: 'missing_customer' });
 
-    // Free-year eligibility (LA_CUTOFF_ISO should be UTC ISO for 11:59 PM PT of your chosen date)
+    // Free-year eligibility
+    const LA_CUTOFF_ISO = '2025-09-10T23:59:59-07:00'; // 11:59 PM PT Sep 10
+    const PROMO_COUPON_ID = 'beta-signup'; // coupon_...
     const createdAt = bizRow.created_at ? new Date(bizRow.created_at) : new Date();
     const eligibleForPromo = !!PROMO_COUPON_ID && createdAt <= new Date(LA_CUTOFF_ISO);
 
-    // Discount window eligibility (DISCOUNT_CODE_LA_CUTOFF_ISO should be UTC ISO for 11:59 PM PT on Sep 21)
+    // Discount window eligibility (11:59 PM PT Sep 21 → 06:59:59.999Z on Sep 22)
+    const DISCOUNT_CODE_LA_CUTOFF_ISO = '2025-09-22T06:59:59.999Z';
     const eligibleForDiscountWindow = new Date() <= new Date(DISCOUNT_CODE_LA_CUTOFF_ISO);
+
+    // Carry the same clientIntentId across calls
+    const clientIntentIdResolved = clientIntentIdTop || plan?.clientIntentId || null;
+    const checkoutKey = safeIdemKey(['checkout', businessId, clientIntentIdResolved || 'once']);
 
     // --- 2) Ensure default PM (ok if absent when invoice is $0) ---
     const cust = await stripe.customers.retrieve(bizRow.stripe_customer_id);
@@ -370,10 +401,7 @@ router.post('/subscribe', async (req, res) => {
     const items = [];
     const normalizedAddons = [];
 
-    // allow clientIntentId top-level or inside plan
-    const clientIntentIdResolved = clientIntentIdTop || plan?.clientIntentId || null;
-
-    // Base (ad-hoc price if cents provided, else mapped)
+    // Base
     if (Number.isFinite(plan.baseAmountCents)) {
       const baseUnit = Math.round(Number(plan.baseAmountCents));
       const basePrice = await stripe.prices.create(
@@ -422,15 +450,15 @@ router.post('/subscribe', async (req, res) => {
       normalizedAddons.push({ kind, quantity, unitCents, priceId: addonPrice.id });
     }
 
-    // --- 3b) Optional discount code resolution (only if inside window and not free-year) ---
+    // --- 3b) Discount resolution (only if inside window and not free-year) ---
     const discountCodeRaw = (
       (discountCodeIn || plan?.couponId || process.env.DEFAULT_DISCOUNT_CODE || '')
         .toString()
         .trim()
     );
 
-    let resolvedDiscount = null; // e.g. { promotion_code: 'promo_...' } or { coupon: '25OFF' }
-    let resolvedKind = null;     // 'promotion_code' | 'coupon'
+    let resolvedDiscount = null; // { promotion_code } or { coupon }
+    let resolvedKind = null;
     let resolvedId = null;
 
     if (!eligibleForPromo && eligibleForDiscountWindow && discountCodeRaw) {
@@ -455,7 +483,7 @@ router.post('/subscribe', async (req, res) => {
       }
     }
 
-    // --- 3c) Idempotency key (unique per press; include discount resolution) ---
+    // --- 3c) Idempotency key for subscription ---
     const idemKey = safeIdemKey([
       'sub',
       businessId,
@@ -470,7 +498,7 @@ router.post('/subscribe', async (req, res) => {
       clientIntentIdResolved || Date.now(),
     ]);
 
-    // --- 4) Create subscription ---
+    // --- 4) Create subscription in Stripe ---
     const subParams = {
       customer: bizRow.stripe_customer_id,
       items,
@@ -492,6 +520,7 @@ router.post('/subscribe', async (req, res) => {
         appliedDiscountId:   eligibleForPromo ? (PROMO_COUPON_ID || '') : (eligibleForDiscountWindow ? (resolvedId || '') : ''),
         discountWindowEligible: eligibleForDiscountWindow ? 'true' : 'false',
         discountWindowCutoffIso: DISCOUNT_CODE_LA_CUTOFF_ISO,
+        checkout_key: checkoutKey, // keep the thread
       },
       expand: [
         'items.data.price',
@@ -501,7 +530,6 @@ router.post('/subscribe', async (req, res) => {
       ],
     };
 
-    // precedence: free-year > discount code
     if (eligibleForPromo) {
       subParams.discounts = [{ coupon: PROMO_COUPON_ID }];
     } else if (resolvedDiscount) {
@@ -511,14 +539,8 @@ router.post('/subscribe', async (req, res) => {
     const subscription = await stripe.subscriptions.create(subParams, { idempotencyKey: idemKey });
 
     // --- 5) Compute allowances ---
-    const addonDrivers = normalizedAddons
-      .filter(a => a.kind === 'driver')
-      .reduce((s, a) => s + (a.quantity || 0), 0);
-
-    const addonStopsHundreds = normalizedAddons
-      .filter(a => a.kind === 'stops100')
-      .reduce((s, a) => s + (a.quantity || 0), 0);
-
+    const addonDrivers = normalizedAddons.filter(a => a.kind === 'driver').reduce((s, a) => s + (a.quantity || 0), 0);
+    const addonStopsHundreds = normalizedAddons.filter(a => a.kind === 'stops100').reduce((s, a) => s + (a.quantity || 0), 0);
     const baseDrivers = Math.max(0, Math.floor(Number(plan.baseDrivers ?? plan.extras?.baseDrivers ?? 0)));
     const baseStops   = Math.max(0, Math.floor(Number(plan.baseStops   ?? plan.extras?.baseStops   ?? 0)));
 
@@ -528,10 +550,10 @@ router.post('/subscribe', async (req, res) => {
     const periodAmountCents = (subscription.items?.data || [])
       .reduce((sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)), 0);
 
-    const promoEndsAt = eligibleForPromo ? addOneYear(createdAt) : null;
+    const promoEndsAt = eligibleForPromo ? (() => { const d = new Date(createdAt); d.setFullYear(d.getFullYear() + 1); return d; })() : null;
     const unlimited = !!eligibleForPromo;
 
-    // --- 6) Upsert Subscriptions row ---
+    // --- 6) Update the *pending* snapshot row if present; else upsert by sub id ---
     const subPayload = {
       business_id: businessId,
       user_id: userId ?? null,
@@ -555,46 +577,66 @@ router.post('/subscribe', async (req, res) => {
       current_period_end:   subscription.current_period_end   ? new Date(subscription.current_period_end   * 1000) : null,
       cancel_at_period_end: !!subscription.cancel_at_period_end,
       canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
-      default_payment_method_id: subscription.default_payment_method || null,
-      latest_invoice_id: typeof subscription.latest_invoice === 'string'
-        ? subscription.latest_invoice
-        : subscription.latest_invoice?.id || null,
-      metadata: subscription.metadata || {},
+      default_payment_method_id:
+        typeof subscription.default_payment_method === 'string'
+          ? subscription.default_payment_method
+          : (subscription.default_payment_method)?.id || null,
+      latest_invoice_id:
+        typeof subscription.latest_invoice === 'string'
+          ? subscription.latest_invoice
+          : subscription.latest_invoice?.id || null,
+      metadata: {
+        ...(subscription.metadata || {}),
+        checkout_key: checkoutKey,
+      },
       updated_at: new Date(),
     };
 
-    const { data: existing } = await supabase
+    // Try to upgrade the pending snapshot by checkout_key
+    const { data: pending } = await supabase
       .from('Subscriptions')
-      .select('id')
-      .eq('stripe_subscription_id', subscription.id)
-      .single();
+      .select('id, created_at')
+      .eq('business_id', businessId)
+      .is('stripe_subscription_id', null)
+      .filter('metadata->>checkout_key', 'eq', checkoutKey)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
 
     let localSubId = null;
-    if (existing?.id) {
-      await supabase.from('Subscriptions')
-        .update(subPayload)
-        .eq('stripe_subscription_id', subscription.id);
-      localSubId = existing.id;
+
+    if (pending?.id) {
+      // Update in place (no new row)
+      await supabase.from('Subscriptions').update(subPayload).eq('id', pending.id);
+      localSubId = pending.id;
     } else {
-      const ins = await supabase.from('Subscriptions')
-        .insert({ ...subPayload, created_at: new Date() })
+      // Fallback: upsert by Stripe subscription id
+      const { data: existing } = await supabase
+        .from('Subscriptions')
         .select('id')
-        .single();
-      localSubId = ins.data?.id ?? null;
+        .eq('stripe_subscription_id', subscription.id)
+        .maybeSingle();
+
+      if (existing?.id) {
+        await supabase.from('Subscriptions')
+          .update(subPayload)
+          .eq('stripe_subscription_id', subscription.id);
+        localSubId = existing.id;
+      } else {
+        const ins = await supabase.from('Subscriptions')
+          .insert({ ...subPayload, created_at: new Date() })
+          .select('id')
+          .single();
+        localSubId = ins.data?.id ?? null;
+      }
     }
 
-    // --- 7) Save first invoice receipt (may be $0; PI may be null) ---
+    // --- 7) Persist first invoice receipt (may be $0) ---
     let paymentIntentClientSecret = null;
-
-    const inv = typeof subscription.latest_invoice === 'object'
-      ? subscription.latest_invoice
-      : null;
+    const inv = typeof subscription.latest_invoice === 'object' ? subscription.latest_invoice : null;
 
     if (inv) {
-      const pi = typeof inv.payment_intent === 'object'
-        ? inv.payment_intent
-        : null;
-
+      const pi = typeof inv.payment_intent === 'object' ? inv.payment_intent : null;
       if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
 
       if (localSubId) {
@@ -642,6 +684,37 @@ router.post('/subscribe', async (req, res) => {
         });
       }
     }
+
+    // Optional cleanup
+    await supabase.from('CustomOffers').delete().eq('business_id', businessId);
+
+    // --- 8) Respond (client will poll /billing/subscriptions/:id until 'active') ---
+    return res.json({
+      subscriptionId: subscription.id,
+      status: subscription.status,
+      paymentIntentClientSecret: paymentIntentClientSecret || null,
+      discount: {
+        freeYear: eligibleForPromo,
+        windowEligible: eligibleForDiscountWindow,
+        appliedCode: eligibleForPromo ? null : (eligibleForDiscountWindow ? (discountCodeRaw || null) : null),
+        kind: eligibleForPromo ? 'free_year_promo' : (eligibleForDiscountWindow ? (resolvedKind || null) : null),
+        id: eligibleForPromo ? (PROMO_COUPON_ID || null) : (eligibleForDiscountWindow ? (resolvedId || null) : null),
+        cutoffIsoUtc: DISCOUNT_CODE_LA_CUTOFF_ISO,
+      },
+      promo: {
+        applied: eligibleForPromo,
+        endsAt: eligibleForPromo ? promoEndsAt : null,
+        unlimitedDrivers: !!eligibleForPromo,
+        unlimitedStops: !!eligibleForPromo,
+      },
+      checkoutKey, // useful for debugging
+    });
+  } catch (e) {
+    console.error('subscribe error', e);
+    return res.status(500).json({ error: 'subscribe failed', detail: String(e?.message || e) });
+  }
+});
+
 
     // Optional: clean up any outstanding custom offers for this business
     await supabase.from('CustomOffers').delete().eq('business_id', businessId);
