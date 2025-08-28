@@ -586,14 +586,10 @@ router.post('/subscribe', async (req, res) => {
       billing_mode: plan.billingMode || 'monthly',
       payment_amount_cents: periodAmountCents,
       currency: 'usd',
-      total_drivers: unlimited ? null : totalDrivers,
-      drivers_left:  unlimited ? null : totalDrivers,
-      total_stops:   unlimited ? null : totalStops,
-      stops_left:    unlimited ? null : totalStops,
       is_promo: unlimited,
       promo_ends_at: promoEndsAt,
-      unlimited_drivers: unlimited,
-      unlimited_stops: unlimited,
+      unlimited_drivers: false,
+      unlimited_stops: false,
       status: subscription.status,
       last_payment_at: null,
       current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null,
@@ -613,6 +609,7 @@ router.post('/subscribe', async (req, res) => {
         checkout_key: checkoutKey,
       },
       updated_at: new Date(),
+      current_promo: eligibleForPromo ? 'beta-signup' : null,
     };
 
     // Try to upgrade the pending snapshot by checkout_key
