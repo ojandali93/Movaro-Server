@@ -58,6 +58,68 @@ router.post('/send-invite', async (req, res) => {
   }
 });
 
+const generateRequestId = () => {
+  return uuidv4();
+};
+
+router.post('/send-update-subscription', async (req, res) => {
+  const { to, name, businessName, businessId, stripeCustomerId, stripeSubscriptionId, status, currentTier, requestedTier, username, contactEmail, contactPhone, notes } = req.body;
+
+  if (!to || !name || !businessName || !businessId || !stripeCustomerId || !stripeSubscriptionId || !status || !currentTier || !requestedTier || !username || !contactEmail || !contactPhone) {
+    return res.status(400).json({ error: 'Missing required fields.' });
+  }
+
+  console.log('to: ', to);
+  console.log('name: ', name);
+  console.log('businessName: ', businessName);
+  console.log('businessId: ', businessId);
+  console.log('stripeCustomerId: ', stripeCustomerId);
+  console.log('stripeSubscriptionId: ', stripeSubscriptionId);
+  console.log('status: ', status);
+  console.log('currentTier: ', currentTier);
+  console.log('requestedTier: ', requestedTier);
+  console.log('username: ', username);
+  console.log('contactEmail: ', contactEmail);
+  console.log('contactPhone: ', contactPhone);
+  try {
+    const transporter = nodemailer.createTransport({
+      service: 'Gmail',
+      auth: {
+        user: process.env.GMAIL_USERNAME,
+        pass: process.env.GMAIL_PASSWORD,
+      },
+    });
+
+    const html = `
+      <div style="font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial;">
+        <h2>Subscription update requested</h2>
+        <p><strong>Business:</strong> ${businessName} (ID: ${businessId})</p>
+        <p><strong>Stripe Customer:</strong> ${stripeCustomerId || '(none)'}</p>
+        <p><strong>Stripe Subscription:</strong> ${stripeSubscriptionId || '(none)'} — <em>${status || 'n/a'}</em></p>
+        <p><strong>Current Tier:</strong> ${currentTier || '(unknown)'}<br/>
+           <strong>Requested Tier:</strong> ${requestedTier || '(unspecified)'}</p>
+        <p><strong>User:</strong> ${username || '(not provided)'}<br/>
+           <strong>Contact:</strong> ${contactEmail || contactEmail || '(no email)'} • ${contactPhone || phone || '(no phone)'}</p>
+        ${notes ? `<p><strong>Notes:</strong><br/>${String(notes).replace(/\n/g,'<br/>')}</p>` : ''}
+        <hr/>
+        <p>Request ID: ${generateRequestId()} • Created: ${new Date().toLocaleString()}</p>
+      </div>
+    `;
+
+    await transporter.sendMail({
+      from: process.env.GMAIL_USERNAME,
+      to,
+      subject: `${businessName} Subscription Update`,
+      html: html,
+    });
+
+    res.status(200).json({ success: true });
+  } catch (error) {
+    console.error('Error sending invite email:', error);
+    res.status(500).json({ error: 'Failed to send email.' });
+  }
+});
+
 router.post('/send-custom-plan', async (req, res) => {
   const { to, name, businessName, username, userid, businessId, drivers, stops } = req.body;
 
