@@ -858,7 +858,7 @@ router.post('/stripe/webhook',
   }
 );
 
-router.get('/billing/subscriptions/:id', async (req, res) => {
+router.get('/subscriptions/:id', async (req, res) => {
   const sub = await stripe.subscriptions.retrieve(req.params.id);
   res.json({ status: sub.status });
 });
