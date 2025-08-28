@@ -162,7 +162,7 @@ router.post('/send-update-subscription', async (req, res) => {
     // --- DB insert (ensure your table name matches) ---
     // Suggested table: "UpdateSubscriptionRequests" (plural)
     const { error: dbErr } = await supabase
-      .from('UpdateSubscriptionRequests')
+      .from('UpdateSubscriptionRequest')
       .insert({
         business_id: businessId,
         user_id: userId,
