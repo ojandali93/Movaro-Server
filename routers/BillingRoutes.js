@@ -621,7 +621,6 @@ router.post('/subscribe', async (req, res) => {
       .select('id, created_at')
       .eq('business_id', businessId)
       .is('stripe_subscription_id', null)
-      .filter('metadata->>checkout_key', 'eq', checkoutKey)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle();
