@@ -321,37 +321,43 @@ router.post("/payment-sheet", async (req, res) => {
 
 router.post('/subscribe', async (req, res) => {
   try {
-    const { businessId, userId, plan, clientIntentId, discountCode: discountCodeIn } = req.body || {};
+    const {
+      businessId,
+      userId,
+      clientIntentId: clientIntentIdTop,
+      discountCode: discountCodeIn,
+      plan,
+    } = req.body || {};
+
     if (!businessId || !plan?.tierId) {
       return res.status(400).json({ error: 'Missing businessId/plan' });
     }
 
-    // 1) load biz incl. created_at for promo eligibility
+    // --- 1) Load business (need created_at for promo eligibility) ---
     const { data: bizRow, error: bizErr } = await supabase
       .from('Business')
       .select('id, stripe_customer_id, created_at')
       .eq('id', businessId)
       .single();
+
     if (bizErr || !bizRow) return res.status(404).json({ error: 'Business not found' });
+    if (!bizRow.stripe_customer_id) return res.status(409).json({ error: 'missing_customer' });
 
-    if (!bizRow.stripe_customer_id) {
-      return res.status(409).json({ error: 'missing_customer' });
-    }
-
-    // Free-year eligibility (unchanged)
+    // Free-year eligibility (LA_CUTOFF_ISO should be UTC ISO for 11:59 PM PT of your chosen date)
     const createdAt = bizRow.created_at ? new Date(bizRow.created_at) : new Date();
-    const eligibleForPromo = createdAt <= new Date(LA_CUTOFF_ISO) && !!PROMO_COUPON_ID;
+    const eligibleForPromo = !!PROMO_COUPON_ID && createdAt <= new Date(LA_CUTOFF_ISO);
 
-    // NEW: discount window eligibility (Pacific time cutoff encoded in UTC)
+    // Discount window eligibility (DISCOUNT_CODE_LA_CUTOFF_ISO should be UTC ISO for 11:59 PM PT on Sep 21)
     const eligibleForDiscountWindow = new Date() <= new Date(DISCOUNT_CODE_LA_CUTOFF_ISO);
-    console.log('eligibleForDiscountWindow', eligibleForDiscountWindow)
 
-    // 2) ensure default PM (same)
+    // --- 2) Ensure default PM (ok if absent when invoice is $0) ---
     const cust = await stripe.customers.retrieve(bizRow.stripe_customer_id);
-    console.log('customer in stripe: ', cust)
     let defaultPM = cust?.invoice_settings?.default_payment_method || null;
     if (!defaultPM) {
-      const pms = await stripe.paymentMethods.list({ customer: bizRow.stripe_customer_id, type: 'card' });
+      const pms = await stripe.paymentMethods.list({
+        customer: bizRow.stripe_customer_id,
+        type: 'card',
+      });
       if (pms.data[0]) {
         await stripe.customers.update(bizRow.stripe_customer_id, {
           invoice_settings: { default_payment_method: pms.data[0].id },
@@ -360,21 +366,75 @@ router.post('/subscribe', async (req, res) => {
       }
     }
 
-    // 3) build items (same)… (omitted for brevity)
+    // --- 3) Build subscription items (base + add-ons) ---
+    const items = [];
+    const normalizedAddons = [];
 
-    // ---------- Resolve a discount code ONLY if inside the window ----------
-    const discountCodeRaw =
-      (discountCodeIn || plan?.couponId || DEFAULT_DISCOUNT_CODE || '').toString().trim();
+    // allow clientIntentId top-level or inside plan
+    const clientIntentIdResolved = clientIntentIdTop || plan?.clientIntentId || null;
 
-    console.log('discount code rawa; ', discountCodeRaw)
+    // Base (ad-hoc price if cents provided, else mapped)
+    if (Number.isFinite(plan.baseAmountCents)) {
+      const baseUnit = Math.round(Number(plan.baseAmountCents));
+      const basePrice = await stripe.prices.create(
+        {
+          unit_amount: baseUnit,
+          currency: 'usd',
+          recurring: { interval: 'month' },
+          product_data: { name: `Movaro ${plan.tierId} (base)` },
+          metadata: { type: 'base', tierId: plan.tierId, businessId: String(businessId) },
+        },
+        { idempotencyKey: safeIdemKey(['price','base', businessId, plan.tierId, baseUnit, clientIntentIdResolved || '']) }
+      );
+      items.push({ price: basePrice.id, quantity: 1 });
+    } else {
+      const mapped = TIER_PRICE_REF[plan.tierId]?.priceId;
+      if (!mapped) return res.status(400).json({ error: `Unknown tierId: ${plan.tierId}` });
+      items.push({ price: mapped, quantity: 1 });
+    }
 
-    let resolvedDiscount = null;
-    let resolvedKind = null;
+    // Add-ons
+    const addonsArr = Array.isArray(plan.addons) ? plan.addons : [];
+    for (const a of addonsArr) {
+      const kind = String(a?.kind || '').toLowerCase();
+      if (!['driver', 'stops100'].includes(kind)) continue;
+
+      const quantity = Math.max(0, Math.floor(Number(a?.quantity || 0)));
+      if (!quantity) continue;
+
+      const unitCents = Math.max(0, Math.round(Number(a?.unitCents || 0)));
+
+      const addonPrice = await stripe.prices.create(
+        {
+          unit_amount: unitCents,
+          currency: 'usd',
+          recurring: { interval: 'month' },
+          product_data: {
+            name: kind === 'driver' ? 'Movaro Driver Add-on' : 'Movaro Stops Add-on (per 100)',
+            metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
+          },
+          metadata: { kind, tierId: plan.tierId, businessId: String(businessId) },
+        },
+        { idempotencyKey: safeIdemKey(['price','addon', kind, businessId, plan.tierId, unitCents, clientIntentIdResolved || '']) }
+      );
+
+      items.push({ price: addonPrice.id, quantity });
+      normalizedAddons.push({ kind, quantity, unitCents, priceId: addonPrice.id });
+    }
+
+    // --- 3b) Optional discount code resolution (only if inside window and not free-year) ---
+    const discountCodeRaw = (
+      (discountCodeIn || plan?.couponId || process.env.DEFAULT_DISCOUNT_CODE || '')
+        .toString()
+        .trim()
+    );
+
+    let resolvedDiscount = null; // e.g. { promotion_code: 'promo_...' } or { coupon: '25OFF' }
+    let resolvedKind = null;     // 'promotion_code' | 'coupon'
     let resolvedId = null;
 
     if (!eligibleForPromo && eligibleForDiscountWindow && discountCodeRaw) {
       try {
-        // Prefer Promotion Code (user-friendly code)
         const pc = await stripe.promotionCodes.list({ code: discountCodeRaw, active: true, limit: 1 });
         if (pc.data[0]) {
           resolvedDiscount = { promotion_code: pc.data[0].id };
@@ -395,7 +455,7 @@ router.post('/subscribe', async (req, res) => {
       }
     }
 
-    // Make sub idempotency key include discount window + code resolution
+    // --- 3c) Idempotency key (unique per press; include discount resolution) ---
     const idemKey = safeIdemKey([
       'sub',
       businessId,
@@ -407,10 +467,10 @@ router.post('/subscribe', async (req, res) => {
         : eligibleForDiscountWindow
           ? (resolvedKind ? `${resolvedKind}:${resolvedId}` : 'inWindow:noDiscount')
           : 'outOfWindow',
-      clientIntentId || Date.now()
+      clientIntentIdResolved || Date.now(),
     ]);
 
-    // 4) create subscription
+    // --- 4) Create subscription ---
     const subParams = {
       customer: bizRow.stripe_customer_id,
       items,
@@ -441,7 +501,7 @@ router.post('/subscribe', async (req, res) => {
       ],
     };
 
-    // precedence: free-year > discount code (but only inside window)
+    // precedence: free-year > discount code
     if (eligibleForPromo) {
       subParams.discounts = [{ coupon: PROMO_COUPON_ID }];
     } else if (resolvedDiscount) {
@@ -450,7 +510,144 @@ router.post('/subscribe', async (req, res) => {
 
     const subscription = await stripe.subscriptions.create(subParams, { idempotencyKey: idemKey });
 
-    // … (rest of endpoint unchanged: allowances, DB upsert, first invoice receipt, response)
+    // --- 5) Compute allowances ---
+    const addonDrivers = normalizedAddons
+      .filter(a => a.kind === 'driver')
+      .reduce((s, a) => s + (a.quantity || 0), 0);
+
+    const addonStopsHundreds = normalizedAddons
+      .filter(a => a.kind === 'stops100')
+      .reduce((s, a) => s + (a.quantity || 0), 0);
+
+    const baseDrivers = Math.max(0, Math.floor(Number(plan.baseDrivers ?? plan.extras?.baseDrivers ?? 0)));
+    const baseStops   = Math.max(0, Math.floor(Number(plan.baseStops   ?? plan.extras?.baseStops   ?? 0)));
+
+    const totalDrivers = baseDrivers + addonDrivers;
+    const totalStops   = baseStops + (addonStopsHundreds * 100);
+
+    const periodAmountCents = (subscription.items?.data || [])
+      .reduce((sum, it) => sum + ((it.price?.unit_amount || 0) * (it.quantity || 1)), 0);
+
+    const promoEndsAt = eligibleForPromo ? addOneYear(createdAt) : null;
+    const unlimited = !!eligibleForPromo;
+
+    // --- 6) Upsert Subscriptions row ---
+    const subPayload = {
+      business_id: businessId,
+      user_id: userId ?? null,
+      stripe_customer_id: bizRow.stripe_customer_id,
+      stripe_subscription_id: subscription.id,
+      tier: plan.tierId,
+      billing_mode: plan.billingMode || 'monthly',
+      payment_amount_cents: periodAmountCents,
+      currency: 'usd',
+      total_drivers: unlimited ? null : totalDrivers,
+      drivers_left:  unlimited ? null : totalDrivers,
+      total_stops:   unlimited ? null : totalStops,
+      stops_left:    unlimited ? null : totalStops,
+      is_promo: unlimited,
+      promo_ends_at: promoEndsAt,
+      unlimited_drivers: unlimited,
+      unlimited_stops: unlimited,
+      status: subscription.status,
+      last_payment_at: null,
+      current_period_start: subscription.current_period_start ? new Date(subscription.current_period_start * 1000) : null,
+      current_period_end:   subscription.current_period_end   ? new Date(subscription.current_period_end   * 1000) : null,
+      cancel_at_period_end: !!subscription.cancel_at_period_end,
+      canceled_at: subscription.canceled_at ? new Date(subscription.canceled_at * 1000) : null,
+      default_payment_method_id: subscription.default_payment_method || null,
+      latest_invoice_id: typeof subscription.latest_invoice === 'string'
+        ? subscription.latest_invoice
+        : subscription.latest_invoice?.id || null,
+      metadata: subscription.metadata || {},
+      updated_at: new Date(),
+    };
+
+    const { data: existing } = await supabase
+      .from('Subscriptions')
+      .select('id')
+      .eq('stripe_subscription_id', subscription.id)
+      .single();
+
+    let localSubId = null;
+    if (existing?.id) {
+      await supabase.from('Subscriptions')
+        .update(subPayload)
+        .eq('stripe_subscription_id', subscription.id);
+      localSubId = existing.id;
+    } else {
+      const ins = await supabase.from('Subscriptions')
+        .insert({ ...subPayload, created_at: new Date() })
+        .select('id')
+        .single();
+      localSubId = ins.data?.id ?? null;
+    }
+
+    // --- 7) Save first invoice receipt (may be $0; PI may be null) ---
+    let paymentIntentClientSecret = null;
+
+    const inv = typeof subscription.latest_invoice === 'object'
+      ? subscription.latest_invoice
+      : null;
+
+    if (inv) {
+      const pi = typeof inv.payment_intent === 'object'
+        ? inv.payment_intent
+        : null;
+
+      if (pi?.client_secret) paymentIntentClientSecret = pi.client_secret;
+
+      if (localSubId) {
+        const charge = pi?.charges?.data?.[0] || null;
+        const fingerprint = charge?.payment_method_details?.card?.fingerprint || null;
+        const card_fingerprint_hash = fingerprint
+          ? crypto.createHash('sha256').update(fingerprint).digest('hex')
+          : null;
+
+        await supabase.from('SubscriptionReceipts').insert({
+          business_id: businessId,
+          subscription_id: localSubId,
+          stripe_invoice_id: inv.id,
+          stripe_payment_intent_id: pi?.id || (typeof inv.payment_intent === 'string' ? inv.payment_intent : null),
+          stripe_charge_id: charge?.id || null,
+          billing_reason: inv.billing_reason || null,
+          invoice_status: inv.status || null,
+          payment_intent_status: pi?.status || null,
+          amount_due_cents: inv.amount_due || 0,
+          amount_paid_cents: inv.amount_paid || 0,
+          amount_remaining_cents: inv.amount_remaining || 0,
+          subtotal_cents: inv.subtotal || 0,
+          tax_cents: inv.tax || 0,
+          discount_total_cents: (inv.total_discount_amounts || []).reduce((s, x) => s + (x.amount || 0), 0),
+          currency: inv.currency || 'usd',
+          period_start: inv.lines?.data?.[0]?.period?.start ? new Date(inv.lines.data[0].period.start * 1000) : null,
+          period_end:   inv.lines?.data?.[0]?.period?.end   ? new Date(inv.lines.data[0].period.end   * 1000) : null,
+          hosted_invoice_url: inv.hosted_invoice_url || null,
+          invoice_pdf_url: inv.invoice_pdf || null,
+          receipt_url: charge?.receipt_url || null,
+          payment_method_id:
+            (pi?.payment_method && typeof pi.payment_method === 'string')
+              ? pi.payment_method
+              : (pi?.payment_method)?.id || null,
+          pm_brand: charge?.payment_method_details?.card?.brand || null,
+          pm_last4: charge?.payment_method_details?.card?.last4 || null,
+          pm_exp_month: charge?.payment_method_details?.card?.exp_month || null,
+          pm_exp_year: charge?.payment_method_details?.card?.exp_year || null,
+          card_fingerprint_hash,
+          customer_email: inv.customer_email || null,
+          customer_name: inv.customer_name || null,
+          line_items: inv.lines || null,
+          raw: inv,
+          created_at: new Date(),
+        });
+      }
+    }
+
+    // Optional: clean up any outstanding custom offers for this business
+    await supabase.from('CustomOffers').delete().eq('business_id', businessId);
+
+    // --- 8) Respond ---
+    const promoEnds = eligibleForPromo ? promoEndsAt : null;
 
     return res.json({
       subscriptionId: subscription.id,
@@ -466,9 +663,9 @@ router.post('/subscribe', async (req, res) => {
       },
       promo: {
         applied: eligibleForPromo,
-        endsAt: eligibleForPromo ? promoEndsAt : null,
-        unlimitedDrivers: unlimited,
-        unlimitedStops: unlimited,
+        endsAt: promoEnds,
+        unlimitedDrivers: !!eligibleForPromo,
+        unlimitedStops: !!eligibleForPromo,
       },
     });
   } catch (e) {
