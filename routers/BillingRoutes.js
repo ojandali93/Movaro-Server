@@ -324,20 +324,22 @@ router.post("/payment-sheet", async (req, res) => {
       updated_at: new Date(),
     };
 
+    let updatedSubscription = null;
+
     if (pendingRow?.id) {
       // Refresh the pending row
       const response = await supabase
         .from("Subscriptions")
         .update(snapshotPayload)
         .eq("id", pendingRow.id)
-        .select();
+        .select().single();
 
       console.log('update pending row: ', response)
     } else {
       // Insert a single pending row for this checkout key
-      const response = await supabase.from("Subscriptions").insert(snapshotPayload);
+      updatedSubscription = await supabase.from("Subscriptions").insert(snapshotPayload).select().single();
 
-      console.log('insert pending row: ', response)
+      console.log('insert pending row: ', updatedSubscription)
     }
 
     // ---------- 6) Respond ----------
@@ -350,7 +352,8 @@ router.post("/payment-sheet", async (req, res) => {
       setupIntentClientSecret: siSecret,     // null if already has card
       merchantCountryCode: "US",
       createdNew,
-      checkoutKey,                           // <<— the client can keep it if needed
+      checkoutKey,
+      subscription: updatedSubscription.id
     });
   } catch (err) {
     console.error("payment-sheet error:", err);
@@ -361,7 +364,6 @@ router.post("/payment-sheet", async (req, res) => {
     });
   }
 });
-
 
 
 router.post('/subscribe', async (req, res) => {
