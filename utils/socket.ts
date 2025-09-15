@@ -2,7 +2,7 @@
 import { Server } from 'socket.io';
 import type { Server as HttpServer } from 'http';
 
-type DriverLocation = {
+export type DriverLocation = {
   driverId: string;
   businessId?: string | null;
   routeId?: string | null;
@@ -14,43 +14,69 @@ type DriverLocation = {
 };
 
 export function attachSocket(http: HttpServer) {
+  const allowedOrigins =
+    process.env.SOCKET_ORIGIN?.split(',').map(s => s.trim()).filter(Boolean) || ['*'];
+
   const io = new Server(http, {
-    cors: { origin: '*' }, // tighten in prod
+    cors: {
+      origin: allowedOrigins,
+      methods: ['GET', 'POST'],
+      credentials: true,
+    },
     path: '/socket.io',
-    transports: ['websocket'],
+    transports: ['websocket'],       // prefer ws on Render
+    // Render can sleep free instances; be resilient to reconnects:
+    pingInterval: 25000,
+    pingTimeout: 60000,
   });
 
+  // (Optional) auth middleware — add JWT validation here if desired
+  // io.use((socket, next) => { /* verify token */ next(); });
+
   io.on('connection', (socket) => {
-    // Managers subscribe to rooms:
+    console.log('🧲 socket connected', socket.id);
+
     socket.on('join:biz', (bizId: string) => {
+      if (!bizId) return;
       socket.join(`biz:${bizId}`);
+      console.log(`👂 ${socket.id} joined biz:${bizId}`);
     });
 
     socket.on('join:route', (routeId: string) => {
+      if (!routeId) return;
       socket.join(`route:${routeId}`);
+      console.log(`👂 ${socket.id} joined route:${routeId}`);
     });
 
-    // Drivers push their location:
     socket.on('driver:location', async (p: DriverLocation) => {
-      // (Optional) validate p.driverId auth here
+      try {
+        if (
+          !p ||
+          !p.driverId ||
+          typeof p.lat !== 'number' ||
+          typeof p.lon !== 'number'
+        ) return;
 
-      // Broadcast to business room if provided
-      if (p.businessId) {
-        io.to(`biz:${p.businessId}`).emit('driver:location', p);
+        // Broadcast to business room
+        if (p.businessId) {
+          io.to(`biz:${p.businessId}`).emit('driver:location', p);
+        }
+
+        // Broadcast to route room
+        if (p.routeId) {
+          io.to(`route:${p.routeId}`).emit('driver:location', p);
+        }
+
+        // (Optional) persist last known / trail here
+        // await upsertLastLocation(p.driverId, p.businessId ?? null, p.lat, p.lon, p.ts ?? Date.now());
+      } catch (e) {
+        console.error('driver:location error', e);
       }
-
-      // Broadcast to route room if provided
-      if (p.routeId) {
-        io.to(`route:${p.routeId}`).emit('driver:location', p);
-      }
-
-      // (Optional) persist last-known
-      // await upsertLastLocation(p.driverId, p.businessId, p.lat, p.lon, p.ts)
-
-      // (Optional) sample trail every N seconds
     });
 
-    socket.on('disconnect', () => {});
+    socket.on('disconnect', (reason) => {
+      console.log('❌ socket disconnected', socket.id, reason);
+    });
   });
 
   return io;
