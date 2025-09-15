@@ -13,7 +13,7 @@ import NotificationRoutes from './routers/NotificationRoutes.js';
 import billingRouter from './routers/BillingRoutes.js';
 
 // ✅ attach socket
-import { attachSocket } from './socket.js';
+import { attachSocket } from './utils/socket.js';
 
 dotenv.config();
 
