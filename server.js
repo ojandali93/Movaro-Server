@@ -1,5 +1,4 @@
 /* eslint-disable quotes */
-// server.js
 import express from "express";
 import dotenv from "dotenv";
 import helmet from "helmet";
@@ -12,9 +11,7 @@ import http from "http";
 
 import NotificationRoutes from "./routers/NotificationRoutes.js";
 import billingRouter from "./routers/BillingRoutes.js";
-// ✅ If you have this router, mount it (since your frontend hits /users/login)
-// import usersRouter from "./routers/UsersRoutes.js";
-
+import usersRouter from "./routers/UsersRoutes.js"; // ✅ ensure this exists
 import { attachSocket } from "./utils/socket.js";
 
 dotenv.config();
@@ -22,14 +19,9 @@ dotenv.config();
 const app = express();
 const server = http.createServer(app);
 
-// Render often sits behind a proxy (needed for rate-limit + correct IP)
 app.set("trust proxy", 1);
-
 const PORT = process.env.PORT || 3000;
 
-// -------------------------
-// Rate limiter
-// -------------------------
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -38,39 +30,30 @@ const limiter = rateLimit({
   message: "Too many requests, please try again later.",
 });
 
-// -------------------------
-// CORS (explicit allowlist)
-// -------------------------
+// ---- CORS ----
 const normalizeOrigin = (o) => (o || "").trim().replace(/\/+$/, "");
 
-// ✅ Explicit allowlist (no trailing slashes)
-const allowedOrigins = [
-  "https://movaro-server.onrender.com",
-  "https://server-hmr6.onrender.com", // ✅ include the actual backend URL throwing the error
-  "https://web-dev-vtpq.onrender.com",
-  "http://localhost:5173",
-  "http://localhost:19006",
-  "http://localhost:8081",
-].map(normalizeOrigin);
+const allowedOrigins = new Set(
+  [
+    "https://movaro-server.onrender.com",
+    "https://server-hmr6.onrender.com",
+    "https://web-dev-vtpq.onrender.com",
+    "http://localhost:5173",
+    "http://localhost:19006",
+    "http://localhost:8081",
+  ].map(normalizeOrigin)
+);
 
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow server-to-server / curl / Postman (no Origin header)
+    // allow server-to-server / Postman
     if (!origin) return callback(null, true);
 
     const normalized = normalizeOrigin(origin);
 
-    if (allowedOrigins.includes(normalized)) {
-      return callback(null, true);
-    }
+    if (allowedOrigins.has(normalized)) return callback(null, true);
 
-    console.log("🚫 Blocked by CORS:", {
-      origin,
-      normalized,
-      allowedOrigins,
-      path: "N/A",
-    });
-
+    console.log("🚫 Blocked by CORS:", { origin, normalized });
     return callback(new Error("Not allowed by CORS"));
   },
   credentials: true,
@@ -79,13 +62,19 @@ const corsOptions = {
   optionsSuccessStatus: 204,
 };
 
-// ✅ CORS FIRST (before helmet, rate limit, and routes)
+// ✅ CORS first + preflight
 app.use(cors(corsOptions));
 app.options("*", cors(corsOptions));
 
-// -------------------------
-// Middlewares
-// -------------------------
+// (optional but extremely useful while debugging)
+app.use((req, _res, next) => {
+  if (req.method === "OPTIONS") {
+    console.log("✅ Preflight:", req.path, "Origin:", req.headers.origin);
+  }
+  next();
+});
+
+// ---- Middlewares ----
 app.use(helmet());
 app.use(morgan("dev"));
 app.use(bodyParser.json());
@@ -95,24 +84,16 @@ app.use(limiter);
 app.use(express.json({ limit: "20mb" }));
 app.use(express.urlencoded({ extended: true, limit: "20mb" }));
 
-// -------------------------
-// Routes
-// -------------------------
+// ---- Routes ----
+app.use("/users", usersRouter); // ✅ REQUIRED for /users/login
 app.use("/notifications", NotificationRoutes);
 app.use("/billing", billingRouter);
-// app.use("/users", usersRouter);
 
 app.get("/health", (req, res) => res.send("✅ Movaro backend is running"));
 
-// -------------------------
-// Socket.IO
-// -------------------------
 attachSocket(server);
 
-// -------------------------
-// Start server
-// -------------------------
 server.listen(PORT, () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-  console.log("✅ Allowed CORS origins:", allowedOrigins);
+  console.log("✅ Allowed CORS origins:", Array.from(allowedOrigins));
 });
